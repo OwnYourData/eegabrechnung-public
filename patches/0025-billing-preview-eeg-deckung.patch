@@ -1,0 +1,167 @@
+diff --git a/web/components/billing-run-form.tsx b/web/components/billing-run-form.tsx
+--- a/web/components/billing-run-form.tsx
++++ b/web/components/billing-run-form.tsx
+@@ -31,6 +31,16 @@ interface DataGapInfo {
+   details: GapDetail[];
+ }
+ 
++// Rohmesswerte je Mitglied (GET /energy/members) — Basis für die EEG-Deckung.
++// consumption_kwh = Bezug EEG (wh_self), consumption_total_kwh = Gesamtverbrauch (wh_total).
++interface MemberEnergyRow {
++  member_id: string;
++  consumption_kwh: number;
++  consumption_total_kwh: number;
++}
++
++type MemberCoverage = { eegKwh: number; totalKwh: number };
++
+ interface ImbalanceWarningInfo {
+   consumption_kwh: number;
+   generation_kwh: number;
+@@ -103,6 +113,9 @@ export default function BillingRunForm({ eegId, members }: BillingRunFormProps)
+   const [dataGap, setDataGap] = useState<DataGapInfo | null>(null);
+   const [imbalanceWarning, setImbalanceWarning] = useState<ImbalanceWarningInfo | null>(null);
+   const [previewResult, setPreviewResult] = useState<{ invoices: { member_id: string; total_amount: number; generation_vat_pct?: number; generation_vat_amount?: number; consumption_kwh: number; generation_kwh: number }[]; count: number } | null>(null);
++  // EEG-Deckung je Mitglied; null = noch nicht geladen.
++  const [coverage, setCoverage] = useState<Map<string, MemberCoverage> | null>(null);
++  const [coverageError, setCoverageError] = useState(false);
+ 
+   const toggleMember = (id: string) => {
+     setSelectedMemberIds((prev) =>
+@@ -110,6 +123,32 @@ export default function BillingRunForm({ eegId, members }: BillingRunFormProps)
+     );
+   };
+ 
++  // EEG-Deckung = Bezug EEG / Gesamtverbrauch. Die Vorschau-Antwort der Abrechnung
++  // liefert nur den Bezug EEG; der Gesamtverbrauch kommt aus den Rohmesswerten.
++  // Fehlschlag ist nicht fatal: die Spalte zeigt dann "—".
++  const loadCoverage = async (from: string, to: string) => {
++    if (!session?.accessToken) return;
++    try {
++      const res = await fetch(
++        `/api/eegs/${eegId}/energy/members?from=${from}&to=${to}`,
++        { headers: { Authorization: `Bearer ${session.accessToken}` } }
++      );
++      if (!res.ok) throw new Error(`HTTP ${res.status}`);
++      const rows: unknown = await res.json();
++      if (!Array.isArray(rows)) throw new Error("unerwartetes Antwortformat");
++      const map = new Map<string, MemberCoverage>();
++      for (const row of rows as MemberEnergyRow[]) {
++        map.set(row.member_id, {
++          eegKwh: row.consumption_kwh ?? 0,
++          totalKwh: row.consumption_total_kwh ?? 0,
++        });
++      }
++      setCoverage(map);
++    } catch {
++      setCoverageError(true);
++    }
++  };
++
+   const handleSubmit = async (e: React.FormEvent, forceOverride?: boolean, preview = false) => {
+     e.preventDefault();
+     if (!session?.accessToken) return;
+@@ -121,6 +160,8 @@ export default function BillingRunForm({ eegId, members }: BillingRunFormProps)
+     setDataGap(null);
+     setPreviewResult(null);
+     setImbalanceWarning(null);
++    setCoverage(null);
++    setCoverageError(false);
+ 
+     try {
+       const body: Record<string, unknown> = {
+@@ -171,6 +212,7 @@ export default function BillingRunForm({ eegId, members }: BillingRunFormProps)
+       const data = await res.json();
+       if (preview) {
+         setPreviewResult({ invoices: data.invoices || [], count: data.invoices_created || 0 });
++        void loadCoverage(periodStart, periodEnd);
+       } else {
+         setSuccess(data.billing_run ?? data);
+         if (data.imbalance_warning) setImbalanceWarning(data.imbalance_warning);
+@@ -226,6 +268,31 @@ export default function BillingRunForm({ eegId, members }: BillingRunFormProps)
+   // Zahl mit Komma-Dezimaltrenner, damit Excel (de) sie beim Einfuegen als Zahl erkennt
+   // (statt z. B. "11.25" als Datum zu interpretieren).
+   const num2 = (v: number): string => (v ?? 0).toFixed(2).replace(".", ",");
++  // Prozentwert mit einer Nachkommastelle, ebenfalls mit Komma-Dezimaltrenner.
++  const num1 = (v: number): string => (v ?? 0).toFixed(1).replace(".", ",");
++
++  // EEG-Deckung eines Mitglieds in Prozent; null = unbekannt oder kein Verbrauch.
++  const deckungPct = (memberId: string): number | null => {
++    const c = coverage?.get(memberId);
++    if (!c || c.totalKwh <= 0) return null;
++    return (c.eegKwh / c.totalKwh) * 100;
++  };
++
++  // Gesamtdeckung ueber die in der Vorschau enthaltenen Mitglieder
++  // (Summe Bezug EEG / Summe Gesamtverbrauch, nicht Mittelwert der Einzelquoten).
++  const gesamtDeckungPct = (memberIds: string[]): number | null => {
++    if (!coverage) return null;
++    let eeg = 0;
++    let total = 0;
++    for (const id of memberIds) {
++      const c = coverage.get(id);
++      if (!c) continue;
++      eeg += c.eegKwh;
++      total += c.totalKwh;
++    }
++    return total > 0 ? (eeg / total) * 100 : null;
++  };
++
+   // Mitgliedsnummer (fuer Sortierung).
+   const memberNr = (id: string): string => {
+     const m = memberById.get(id);
+@@ -292,6 +359,7 @@ export default function BillingRunForm({ eegId, members }: BillingRunFormProps)
+                 <th className="text-right py-1 pl-3">Bezug kWh</th>
+                 <th className="text-right py-1 pl-3">Einspeisung kWh</th>
+                 <th className="text-right py-1 pl-3">Betrag (€)</th>
++                <th className="text-right py-1 pl-3" title="Bezug EEG / Gesamtverbrauch im Abrechnungszeitraum">EEG-Deckung (%)</th>
+               </tr>
+             </thead>
+             <tbody>
+@@ -301,6 +369,8 @@ export default function BillingRunForm({ eegId, members }: BillingRunFormProps)
+                 const m = memberById.get(inv.member_id);
+                 const zps = memberZaehlpunkte(m);
+                 const strasse = streetName(m?.strasse);
++                const cov = coverage?.get(inv.member_id);
++                const pct = deckungPct(inv.member_id);
+                 return (
+                   <tr key={i} className="border-b border-blue-100 align-top">
+                     <td className="py-1 pr-3 font-mono">{m?.member_number || m?.mitglieds_nr || "—"}</td>
+@@ -315,6 +385,12 @@ export default function BillingRunForm({ eegId, members }: BillingRunFormProps)
+                     <td className="py-1 pl-3 text-right">{num2(inv.consumption_kwh ?? 0)}</td>
+                     <td className="py-1 pl-3 text-right">{num2(inv.generation_kwh ?? 0)}</td>
+                     <td className="py-1 pl-3 text-right font-medium">{num2(previewZahlBetrag(inv))}</td>
++                    <td
++                      className="py-1 pl-3 text-right"
++                      title={cov ? `${num2(cov.eegKwh)} von ${num2(cov.totalKwh)} kWh Gesamtverbrauch` : undefined}
++                    >
++                      {pct != null ? num1(pct) : "—"}
++                    </td>
+                   </tr>
+                 );
+               })}
+@@ -331,10 +407,24 @@ export default function BillingRunForm({ eegId, members }: BillingRunFormProps)
+                 <td className="py-1 pl-3 text-right">
+                   {num2(previewResult.invoices.reduce((s, inv) => s + previewZahlBetrag(inv), 0))}
+                 </td>
++                <td className="py-1 pl-3 text-right">
++                  {(() => {
++                    const g = gesamtDeckungPct(previewResult.invoices.map((inv) => inv.member_id));
++                    return g != null ? num1(g) : "—";
++                  })()}
++                </td>
+               </tr>
+             </tfoot>
+           </table>
+           </div>
++          {!coverage && !coverageError && (
++            <p className="text-xs text-blue-600 mt-2">EEG-Deckung wird geladen …</p>
++          )}
++          {coverageError && (
++            <p className="text-xs text-amber-700 mt-2">
++              EEG-Deckung konnte nicht geladen werden — die Spalte bleibt leer. Die übrigen Werte sind davon nicht betroffen.
++            </p>
++          )}
+           <p className="text-xs text-blue-600 mt-2">Klicken Sie auf &quot;Abrechnung starten&quot; um fortzufahren.</p>
+         </div>
+       )}

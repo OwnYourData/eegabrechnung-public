@@ -1,0 +1,378 @@
+diff --git a/web/app/portal/dashboard/PortalDashboardClient.tsx b/web/app/portal/dashboard/PortalDashboardClient.tsx
+index 59934e3..5d7e916 100644
+--- a/web/app/portal/dashboard/PortalDashboardClient.tsx
++++ b/web/app/portal/dashboard/PortalDashboardClient.tsx
+@@ -143,17 +143,12 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+     return () => clearTimeout(id);
+   }, [appQr, appRemaining]);
+ 
+-  // QR automatisch erneuern, sobald er abläuft (der Reviewer soll nie in einen
+-  // abgelaufenen Code laufen). Kein Loop: während des Ladens greift der appLoading-Guard.
+-  useEffect(() => {
+-    if (activeTab !== "app" || !appQr || appRemaining > 0 || appLoading) return;
+-    loadAppToken();
+-  }, [activeTab, appQr, appRemaining, appLoading, loadAppToken]);
+-
+   // ── App-Pairing (Bestätigung) + verbundene Geräte ────────────────────────────
+-  const [pairing, setPairing] = useState<{ id: string; pairingCode: string; deviceLabel: string } | null>(null);
+-  const [pairingBusy, setPairingBusy] = useState(false);
++  type PairingReq = { id: string; pairingCode: string; deviceLabel: string };
++  const [pairings, setPairings] = useState<PairingReq[]>([]);
++  const [pairingBusy, setPairingBusy] = useState<string | null>(null);
+   const [pairingMsg, setPairingMsg] = useState<string | null>(null);
++  const [confirmedDevice, setConfirmedDevice] = useState<string | null>(null);
+   const [devices, setDevices] = useState<
+     { id: string | number; deviceLabel: string; createdAt: string; lastUsedAt: string }[]
+   >([]);
+@@ -181,25 +176,24 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+     return () => clearInterval(iv);
+   }, [activeTab, loadDevices]);
+ 
+-  // Polling alle 2s — nur solange der QR gültig ist (die Pairing-Anfrage lebt ohnehin nur 2 Minuten).
+-  const qrValid = appRemaining > 0;
++  // Polling alle 2 s — solange ein QR gültig ist ODER eine Anfrage offen ist.
++  // Stoppt bei Ablauf (Zustand D) und nach Bestätigung (Zustand C) — nicht endlos fragen.
++  const pollActive = !confirmedDevice && (appRemaining > 0 || pairings.length > 0);
+   useEffect(() => {
+-    if (activeTab !== "app" || !qrValid) return;
++    if (activeTab !== "app" || !pollActive) return;
+     let cancelled = false;
+     const tick = () => {
+       fetch("/api/portal/app-pairings")
+         .then((r) => (r.ok ? r.json() : []))
+         .then((list) => {
+           if (cancelled) return;
+-          const p = Array.isArray(list) && list.length > 0 ? list[0] : null;
+-          setPairing(
+-            p
+-              ? {
+-                  id: String(p.id),
+-                  pairingCode: String(p.pairingCode ?? ""),
+-                  deviceLabel: String(p.deviceLabel ?? "Unbekanntes Gerät"),
+-                }
+-              : null
++          // NIEMALS automatisch eine Anfrage auswählen — alle anzeigen.
++          setPairings(
++            (Array.isArray(list) ? list : []).map((p: { id: unknown; pairingCode?: unknown; deviceLabel?: unknown }) => ({
++              id: String(p.id),
++              pairingCode: String(p.pairingCode ?? ""),
++              deviceLabel: String(p.deviceLabel ?? "Unbekanntes Gerät"),
++            }))
+           );
+         })
+         .catch(() => {});
+@@ -210,37 +204,37 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+       cancelled = true;
+       clearInterval(iv);
+     };
+-  }, [activeTab, qrValid]);
++  }, [activeTab, pollActive]);
+ 
+   const respondPairing = useCallback(
+-    (id: string, action: "confirm" | "reject") => {
+-      setPairingBusy(true);
++    (id: string, deviceLabel: string, action: "confirm" | "reject") => {
++      setPairingBusy(id);
+       setPairingMsg(null);
+       fetch(`/api/portal/app-pairings/${id}/${action}`, { method: "POST" })
+         .then((r) => {
+           if (r.status === 204) {
+-            setPairing(null);
+-            setPairingMsg(
+-              action === "confirm"
+-                ? "Gerät erfolgreich verbunden."
+-                : "Anfrage abgelehnt. Es wurde keine Verbindung hergestellt."
+-            );
+-            // Die GrünLicht-API legt die Session erst NACH dem Confirm an — deshalb
+-            // kurz nachfassen, damit das neue Gerät ohne Reload sofort erscheint.
+-            loadDevices();
+-            setTimeout(loadDevices, 1000);
+-            setTimeout(loadDevices, 3000);
++            setPairings((prev) => prev.filter((p) => p.id !== id));
++            if (action === "confirm") {
++              setConfirmedDevice(deviceLabel); // -> Zustand C
++              // Die API legt die Session erst NACH dem Confirm an — kurz nachfassen.
++              loadDevices();
++              setTimeout(loadDevices, 1000);
++              setTimeout(loadDevices, 3000);
++            } else {
++              setPairingMsg("Anfrage abgelehnt. Es wurde keine Verbindung hergestellt. Ein neuer Code wird geladen.");
++              loadAppToken(); // der gescannte Token ist serverseitig verbraucht
++            }
+           } else if (r.status === 410) {
+-            setPairing(null);
++            setPairings((prev) => prev.filter((p) => p.id !== id));
+             setPairingMsg("Die Anfrage ist abgelaufen. Bitte in der App erneut scannen.");
+           } else {
+             setPairingMsg("Die Anfrage konnte nicht verarbeitet werden.");
+           }
+         })
+         .catch(() => setPairingMsg("Verbindungsfehler."))
+-        .finally(() => setPairingBusy(false));
++        .finally(() => setPairingBusy(null));
+     },
+-    [loadDevices]
++    [loadDevices, loadAppToken]
+   );
+ 
+   const revokeDevice = useCallback(
+@@ -757,59 +751,12 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+                 Download bereitstehen.
+               </p>
+             </div>
+-            {pairing && (
+-              <div className="rounded-lg border-2 border-red-400 bg-red-50 p-4 space-y-3">
+-                <p className="text-sm font-semibold text-red-900">
+-                  Ein Gerät möchte sich mit deinem Konto verbinden.
+-                </p>
+-                <dl className="text-sm text-red-900 space-y-1">
+-                  <div className="flex gap-2">
+-                    <dt className="w-16 text-red-700">Gerät:</dt>
+-                    <dd className="font-medium">{pairing.deviceLabel}</dd>
+-                  </div>
+-                  <div className="flex gap-2 items-center">
+-                    <dt className="w-16 text-red-700">Code:</dt>
+-                    <dd className="font-mono text-lg font-bold tracking-widest">{pairing.pairingCode}</dd>
+-                  </div>
+-                </dl>
+-                <p className="text-xs text-red-800">
+-                  Vergleiche den Code mit dem, der in deiner App angezeigt wird. Stimmt er{" "}
+-                  <strong>nicht</strong> überein — oder hast du gerade gar nichts gescannt — dann bitte{" "}
+-                  <strong>ablehnen</strong>.
+-                </p>
+-                <p className="text-xs text-red-900 font-medium bg-red-100 rounded px-3 py-2">
+-                  Nur bestätigen, wenn Sie gerade <strong>selbst</strong> die App verbinden. Geben Sie
+-                  Ihren Verbindungs-Code <strong>niemals telefonisch weiter</strong> — niemand von der
+-                  Energiegemeinschaft wird Sie danach fragen.
+-                </p>
+-                <div className="flex gap-3">
+-                  <button
+-                    onClick={() => respondPairing(pairing.id, "confirm")}
+-                    disabled={pairingBusy}
+-                    className="px-4 py-2 text-sm font-medium rounded-lg bg-green-700 text-white hover:bg-green-800 disabled:opacity-60 transition-colors"
+-                  >
+-                    Bestätigen
+-                  </button>
+-                  <button
+-                    onClick={() => respondPairing(pairing.id, "reject")}
+-                    disabled={pairingBusy}
+-                    className="px-4 py-2 text-sm font-medium rounded-lg bg-white border border-red-400 text-red-800 hover:bg-red-100 disabled:opacity-60 transition-colors"
+-                  >
+-                    Ablehnen
+-                  </button>
+-                </div>
+-              </div>
+-            )}
+-            {pairingMsg && (
+-              <p className="text-sm text-slate-700 bg-slate-100 rounded-lg px-4 py-2">{pairingMsg}</p>
+-            )}
++
+             <div>
+               <h2 className="text-lg font-semibold text-slate-900">App verbinden</h2>
+-              <p className="text-sm text-slate-600 mt-1">
+-                Scannen Sie diesen QR-Code mit der <strong>EEG GrünLicht App</strong>, um sich in der App anzumelden.
+-              </p>
+             </div>
+-            {appLoading && !appQr && <p className="text-sm text-slate-500">QR-Code wird geladen …</p>}
++
++            {appLoading && !appQr && <p className="text-sm text-slate-500">Wird geladen …</p>}
+             {appError && !appQr && (
+               <div className="space-y-2">
+                 <p className="text-sm text-red-600">{appError}</p>
+@@ -821,51 +768,134 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+                 </button>
+               </div>
+             )}
+-            {appQr && (
++
++            {confirmedDevice ? (
++              /* ── Zustand C — bestätigt ───────────────────────────────────────── */
++              <div className="rounded-lg border border-green-300 bg-green-50 p-4 space-y-3">
++                <p className="text-sm font-semibold text-green-900">Gerät verbunden</p>
++                <p className="text-sm text-green-900">
++                  <strong>{confirmedDevice}</strong> hat jetzt Zugriff auf Ihr Konto. Sie finden es
++                  unten unter <strong>Verbundene Geräte</strong> — dort können Sie den Zugriff
++                  jederzeit wieder entziehen.
++                </p>
++                <button
++                  onClick={() => {
++                    setConfirmedDevice(null);
++                    setPairingMsg(null);
++                    loadAppToken();
++                  }}
++                  className="px-4 py-2 text-sm font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 transition-colors"
++                >
++                  Weiteres Gerät verbinden
++                </button>
++              </div>
++            ) : pairings.length > 0 ? (
++              /* ── Zustand B — gescannt, wartet auf Bestätigung (QR ist WEG) ───── */
++              <div className="space-y-4">
++                {pairings.length > 1 && (
++                  <div className="rounded-lg border-2 border-amber-400 bg-amber-50 p-3">
++                    <p className="text-xs text-amber-900">
++                      ⚠️ Es liegen <strong>mehrere</strong> Verbindungsanfragen vor. Bestätigen Sie nur
++                      die Anfrage, deren Code <strong>exakt</strong> dem entspricht, den Ihre App
++                      anzeigt. Kennen Sie eine der Anfragen nicht: ablehnen und den Code anschließend
++                      neu laden.
++                    </p>
++                  </div>
++                )}
++                {pairings.map((p) => (
++                  <div key={p.id} className="rounded-lg border-2 border-red-400 bg-red-50 p-4 space-y-3">
++                    <p className="text-sm font-semibold text-red-900">
++                      Ein Gerät möchte sich mit Ihrem Konto verbinden.
++                    </p>
++                    <dl className="text-sm text-red-900 space-y-1">
++                      <div className="flex gap-2">
++                        <dt className="w-16 text-red-700">Gerät:</dt>
++                        <dd className="font-medium">{p.deviceLabel}</dd>
++                      </div>
++                      <div className="flex gap-2 items-center">
++                        <dt className="w-16 text-red-700">Code:</dt>
++                        <dd className="font-mono text-2xl font-bold tracking-widest">{p.pairingCode}</dd>
++                      </div>
++                    </dl>
++                    <p className="text-xs text-red-800">
++                      Vergleichen Sie den Code mit dem, der in Ihrer App angezeigt wird. Stimmt er{" "}
++                      <strong>nicht</strong> überein — oder haben Sie gerade gar nichts gescannt — dann
++                      bitte <strong>ablehnen</strong>.
++                    </p>
++                    <p className="text-xs text-red-900 font-medium bg-red-100 rounded px-3 py-2">
++                      Nur bestätigen, wenn Sie gerade <strong>selbst</strong> die App verbinden. Geben
++                      Sie den Code <strong>niemals telefonisch weiter</strong> — niemand von der
++                      Energiegemeinschaft wird Sie danach fragen.
++                    </p>
++                    <div className="flex gap-3">
++                      <button
++                        onClick={() => respondPairing(p.id, p.deviceLabel, "confirm")}
++                        disabled={pairingBusy !== null}
++                        className="px-4 py-2 text-sm font-medium rounded-lg bg-green-700 text-white hover:bg-green-800 disabled:opacity-60 transition-colors"
++                      >
++                        Bestätigen
++                      </button>
++                      <button
++                        onClick={() => respondPairing(p.id, p.deviceLabel, "reject")}
++                        disabled={pairingBusy !== null}
++                        className="px-4 py-2 text-sm font-medium rounded-lg bg-white border border-red-400 text-red-800 hover:bg-red-100 disabled:opacity-60 transition-colors"
++                      >
++                        Ablehnen
++                      </button>
++                    </div>
++                  </div>
++                ))}
++              </div>
++            ) : appQr && appRemaining <= 0 ? (
++              /* ── Zustand D — abgelaufen (ohne Scan) ──────────────────────────── */
+               <div className="flex flex-col items-center gap-4">
+                 <div className="relative">
+                   {/* eslint-disable-next-line @next/next/no-img-element */}
+                   <img
+                     src={appQr.qr}
+-                    alt="QR-Code zum Verbinden der App"
+-                    className={`w-64 h-64 rounded-xl border border-slate-200 bg-white p-3 transition-all ${
+-                      appRemaining <= 0 ? "opacity-20 blur-sm" : ""
+-                    }`}
++                    alt="Abgelaufener QR-Code"
++                    className="w-64 h-64 rounded-xl border border-slate-200 bg-white p-3 opacity-20 blur-sm"
+                   />
+-                  {appRemaining <= 0 && (
+-                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
+-                      <span className="text-sm font-semibold text-slate-700">Code abgelaufen</span>
+-                      <button
+-                        onClick={loadAppToken}
+-                        disabled={appLoading}
+-                        className="px-4 py-2 text-sm font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 transition-colors disabled:opacity-60"
+-                      >
+-                        Neuen Code laden
+-                      </button>
+-                    </div>
+-                  )}
++                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
++                    <span className="text-sm font-semibold text-slate-700">Code abgelaufen</span>
++                    <button
++                      onClick={loadAppToken}
++                      disabled={appLoading}
++                      className="px-4 py-2 text-sm font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-60 transition-colors"
++                    >
++                      Neu laden
++                    </button>
++                  </div>
+                 </div>
+-                {appQr.pairing_code && appRemaining > 0 && (
++              </div>
++            ) : appQr ? (
++              /* ── Zustand A — bereit ──────────────────────────────────────────── */
++              <div className="flex flex-col items-center gap-4">
++                <p className="text-sm text-slate-600 text-center">
++                  Scannen Sie diesen Code mit der <strong>EEG GrünLicht App</strong> — oder tippen Sie
++                  den Code darunter ein.
++                </p>
++                {/* eslint-disable-next-line @next/next/no-img-element */}
++                <img
++                  src={appQr.qr}
++                  alt="QR-Code zum Verbinden der App"
++                  className="w-64 h-64 rounded-xl border border-slate-200 bg-white p-3"
++                />
++                {appQr.pairing_code && (
+                   <div className="text-center">
+-                    <p className="text-xs text-slate-500 mb-1">
+-                      Kamera geht nicht? Diesen Code in der App eintippen:
+-                    </p>
++                    <p className="text-xs text-slate-500 mb-1">Kamera geht nicht? Diesen Code eintippen:</p>
+                     <p className="font-mono text-2xl font-bold tracking-widest text-slate-900">
+                       {appQr.pairing_code.slice(0, 4)}-{appQr.pairing_code.slice(4)}
+                     </p>
+                   </div>
+                 )}
+-                {appRemaining > 0 ? (
+-                  <p className="text-xs text-slate-500 text-center">
+-                    Aus Sicherheitsgründen ist der Code nur noch{" "}
+-                    <span className="font-medium text-slate-700 tabular-nums">
+-                      {Math.floor(appRemaining / 60)}:{String(appRemaining % 60).padStart(2, "0")}
+-                    </span>{" "}
+-                    gültig. Danach bitte neu laden.
+-                  </p>
+-                ) : (
+-                  <p className="text-xs text-red-600 text-center">Der Code ist abgelaufen. Bitte neuen Code laden.</p>
+-                )}
++                <p className="text-xs text-slate-500 text-center">
++                  Aus Sicherheitsgründen ist der Code nur noch{" "}
++                  <span className="font-medium text-slate-700 tabular-nums">
++                    {Math.floor(appRemaining / 60)}:{String(appRemaining % 60).padStart(2, "0")}
++                  </span>{" "}
++                  gültig.
++                </p>
+                 <div className="flex gap-3 flex-wrap justify-center">
+                   {appQr.ios_url && (
+                     <a
+@@ -888,16 +918,17 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+                     </a>
+                   )}
+                 </div>
+-                <p className="text-xs text-slate-400 text-center">
+-                  Noch keine App? Laden Sie die „EEG GrünLicht App“ über die Links oben.
+-                </p>
+               </div>
++            ) : null}
++
++            {pairingMsg && (
++              <p className="text-sm text-slate-700 bg-slate-100 rounded-lg px-4 py-2">{pairingMsg}</p>
+             )}
+ 
+             <div className="border-t border-slate-200 pt-5">
+               <h3 className="text-base font-semibold text-slate-900 mb-1">Verbundene Geräte</h3>
+               <p className="text-xs text-slate-500 mb-3">
+-                Geräte, die aktuell auf dein Konto zugreifen dürfen. „Zugriff entziehen“ wirkt sofort.
++                Geräte, die aktuell auf Ihr Konto zugreifen dürfen. „Zugriff entziehen“ wirkt sofort.
+               </p>
+               {devicesLoading && devices.length === 0 && (
+                 <p className="text-sm text-slate-500">Wird geladen …</p>
+@@ -929,6 +960,7 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+           </div>
+         )}
+ 
++
+         {/* Zählpunkte Tab */}
+         {activeTab === "zaehlpunkte" && (
+           <div className="space-y-4">

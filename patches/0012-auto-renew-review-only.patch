@@ -1,0 +1,67 @@
+diff --git a/api/internal/handler/portal_app_token.go b/api/internal/handler/portal_app_token.go
+index 49fa345..379f1dd 100644
+--- a/api/internal/handler/portal_app_token.go
++++ b/api/internal/handler/portal_app_token.go
+@@ -105,10 +105,22 @@ func (h *MemberPortalHandler) GetAppToken(w http.ResponseWriter, r *http.Request
+ 
+ 	// The signed JWT (and thus the login token) is deliberately NOT returned in the JSON
+ 	// body — it exists only inside the rendered QR image.
++	// Auto-Erneuerung NUR für den Apple-Review-Zugang: Das Demo-Konto (is_demo) soll
++	// nie in einen abgelaufenen Code laufen. Echte Mitglieder bekommen bewusst
++	// Zustand D (abgelaufen -> "Neu laden"), damit ein gescannter Code nicht
++	// stillschweigend durch einen neuen ersetzt wird.
++	autoRenew := false
++	if reviewEnabled() {
++		if demo, derr := h.portalRepo.IsDemoMember(r.Context(), memberID); derr == nil && demo {
++			autoRenew = true
++		}
++	}
++
+ 	w.Header().Set("Content-Type", "application/json")
+ 	_ = json.NewEncoder(w).Encode(map[string]string{
+ 		"qr":           "data:image/png;base64," + base64.StdEncoding.EncodeToString(png),
+ 		"pairing_code": pairingCode,
++		"auto_renew":   strconv.FormatBool(autoRenew),
+ 		"ios_url":     strings.TrimSpace(os.Getenv(envAppIOSURL)),
+ 		"android_url": strings.TrimSpace(os.Getenv(envAppAndroidURL)),
+ 		"expires_in":  strconv.Itoa(int(ttl.Seconds())),
+diff --git a/web/app/portal/dashboard/PortalDashboardClient.tsx b/web/app/portal/dashboard/PortalDashboardClient.tsx
+index 5d7e916..e94e09e 100644
+--- a/web/app/portal/dashboard/PortalDashboardClient.tsx
++++ b/web/app/portal/dashboard/PortalDashboardClient.tsx
+@@ -117,7 +117,7 @@ interface Props {
+ 
+ export default function PortalDashboardClient({ member, eeg, invoices, documents, meterPoints, showFullEnergy }: Props) {
+   const [activeTab, setActiveTab] = useState<"energy" | "invoices" | "downloads" | "zaehlpunkte" | "profil" | "app">("energy");
+-  const [appQr, setAppQr] = useState<{ qr: string; pairing_code?: string; ios_url: string; android_url: string; expires_in: number } | null>(null);
++  const [appQr, setAppQr] = useState<{ qr: string; pairing_code?: string; auto_renew?: boolean; ios_url: string; android_url: string; expires_in: number } | null>(null);
+   const [appLoading, setAppLoading] = useState(false);
+   const [appError, setAppError] = useState<string | null>(null);
+   const [appRemaining, setAppRemaining] = useState(0);
+@@ -128,7 +128,7 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+       .then((r) => (r.ok ? r.json() : Promise.reject(new Error("failed"))))
+       .then((d) => {
+         const ttl = Number(d.expires_in) || 180;
+-        setAppQr({ qr: d.qr, pairing_code: d.pairing_code, ios_url: d.ios_url, android_url: d.android_url, expires_in: ttl });
++        setAppQr({ qr: d.qr, pairing_code: d.pairing_code, auto_renew: d.auto_renew === "true", ios_url: d.ios_url, android_url: d.android_url, expires_in: ttl });
+         setAppRemaining(ttl);
+       })
+       .catch(() => setAppError("QR-Code konnte nicht geladen werden."))
+@@ -206,6 +206,17 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+     };
+   }, [activeTab, pollActive]);
+ 
++  // Auto-Erneuerung: NUR wenn das Backend sie erlaubt (auto_renew — d. h. Apple-Review
++  // aktiv UND Demo-Konto). Greift ausschließlich in Zustand D; nie bei offener Anfrage (B)
++  // oder nach Bestätigung (C), sonst würde der Code unter dem Nutzer weggezogen.
++  useEffect(() => {
++    if (activeTab !== "app") return;
++    if (!appQr?.auto_renew) return;
++    if (appRemaining > 0 || appLoading) return;
++    if (pairings.length > 0 || confirmedDevice) return;
++    loadAppToken();
++  }, [activeTab, appQr, appRemaining, appLoading, pairings, confirmedDevice, loadAppToken]);
++
+   const respondPairing = useCallback(
+     (id: string, deviceLabel: string, action: "confirm" | "reject") => {
+       setPairingBusy(id);

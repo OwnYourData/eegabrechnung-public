@@ -1,0 +1,164 @@
+diff --git a/api/internal/handler/portal_app_token.go b/api/internal/handler/portal_app_token.go
+index 379f1dd..c6d741f 100644
+--- a/api/internal/handler/portal_app_token.go
++++ b/api/internal/handler/portal_app_token.go
+@@ -120,6 +120,7 @@ func (h *MemberPortalHandler) GetAppToken(w http.ResponseWriter, r *http.Request
+ 	_ = json.NewEncoder(w).Encode(map[string]string{
+ 		"qr":           "data:image/png;base64," + base64.StdEncoding.EncodeToString(png),
+ 		"pairing_code": pairingCode,
++		"app_link":     strings.TrimRight(h.webBaseURL, "/") + "/app/pair?t=" + jwtStr,
+ 		"auto_renew":   strconv.FormatBool(autoRenew),
+ 		"ios_url":     strings.TrimSpace(os.Getenv(envAppIOSURL)),
+ 		"android_url": strings.TrimSpace(os.Getenv(envAppAndroidURL)),
+diff --git a/web/app/api/well-known/aasa/route.ts b/web/app/api/well-known/aasa/route.ts
+new file mode 100644
+index 0000000..af48cca
+--- /dev/null
++++ b/web/app/api/well-known/aasa/route.ts
+@@ -0,0 +1,22 @@
++export const dynamic = "force-static";
++
++// Apple-App-Site-Association (Universal Links). Öffentlich erreichbar unter
++// /.well-known/apple-app-site-association via Rewrite in next.config.mjs.
++// Nur der Pfad /app/pair (und Unterpfade) darf die App aufrufen.
++export function GET() {
++  const body = {
++    applinks: {
++      apps: [],
++      details: [
++        {
++          appID: "39G4BK327Q.at.eeg-gruenlicht.gruenlichtApp",
++          paths: ["/app/pair", "/app/pair/*"],
++        },
++      ],
++    },
++  };
++  return new Response(JSON.stringify(body), {
++    status: 200,
++    headers: { "content-type": "application/json" },
++  });
++}
+diff --git a/web/app/api/well-known/assetlinks/route.ts b/web/app/api/well-known/assetlinks/route.ts
+new file mode 100644
+index 0000000..47a4dea
+--- /dev/null
++++ b/web/app/api/well-known/assetlinks/route.ts
+@@ -0,0 +1,30 @@
++export const dynamic = "force-dynamic";
++
++// Android App Links. Öffentlich erreichbar unter /.well-known/assetlinks.json
++// via Rewrite. Die beiden SHA-256-Fingerprints kommen aus der Umgebung
++// (kein Rebuild nötig, um sie zu ändern):
++//   ANDROID_ASSETLINKS_SHA256_PLAY   — Play-App-Signing-Schlüssel (Pflicht für Store-Installationen)
++//   ANDROID_ASSETLINKS_SHA256_UPLOAD — Upload-Schlüssel (für lokale flutter-run-Builds)
++export function GET() {
++  const fps = [
++    process.env.ANDROID_ASSETLINKS_SHA256_PLAY,
++    process.env.ANDROID_ASSETLINKS_SHA256_UPLOAD,
++  ]
++    .map((f) => (f ?? "").trim())
++    .filter((f) => f.length > 0);
++
++  const body = [
++    {
++      relation: ["delegate_permission/common.handle_all_urls"],
++      target: {
++        namespace: "android_app",
++        package_name: "at.eeggruenlicht.gruenlicht_app",
++        sha256_cert_fingerprints: fps,
++      },
++    },
++  ];
++  return new Response(JSON.stringify(body, null, 2), {
++    status: 200,
++    headers: { "content-type": "application/json" },
++  });
++}
+diff --git a/web/app/app/pair/page.tsx b/web/app/app/pair/page.tsx
+new file mode 100644
+index 0000000..eaf9206
+--- /dev/null
++++ b/web/app/app/pair/page.tsx
+@@ -0,0 +1,21 @@
++export const metadata = { robots: { index: false, follow: false } };
++
++// Fallback, falls der Universal/App-Link im BROWSER landet (App nicht installiert
++// oder Desktop). Verarbeitet den Token bewusst NICHT — der ist für die App.
++export default function AppPairFallbackPage() {
++  return (
++    <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
++      <div className="bg-white rounded-2xl shadow-md p-8 max-w-md w-full text-center space-y-4">
++        <h1 className="text-xl font-semibold text-slate-900">EEG GrünLicht App verbinden</h1>
++        <p className="text-sm text-slate-600">
++          Dieser Link öffnet die <strong>EEG GrünLicht App</strong>. Wenn Sie ihn hier im Browser
++          sehen, ist die App auf diesem Gerät nicht installiert — oder Sie sind am Computer.
++        </p>
++        <p className="text-sm text-slate-600">
++          Öffnen Sie das Mitgliederportal auf Ihrem Handy mit installierter App und tippen Sie dort
++          unter „App verbinden“ auf „In der EEG GrünLicht App öffnen“ — oder scannen Sie den QR-Code.
++        </p>
++      </div>
++    </div>
++  );
++}
+diff --git a/web/app/portal/dashboard/PortalDashboardClient.tsx b/web/app/portal/dashboard/PortalDashboardClient.tsx
+index e94e09e..e81e536 100644
+--- a/web/app/portal/dashboard/PortalDashboardClient.tsx
++++ b/web/app/portal/dashboard/PortalDashboardClient.tsx
+@@ -117,10 +117,14 @@ interface Props {
+ 
+ export default function PortalDashboardClient({ member, eeg, invoices, documents, meterPoints, showFullEnergy }: Props) {
+   const [activeTab, setActiveTab] = useState<"energy" | "invoices" | "downloads" | "zaehlpunkte" | "profil" | "app">("energy");
+-  const [appQr, setAppQr] = useState<{ qr: string; pairing_code?: string; auto_renew?: boolean; ios_url: string; android_url: string; expires_in: number } | null>(null);
++  const [appQr, setAppQr] = useState<{ qr: string; pairing_code?: string; app_link?: string; auto_renew?: boolean; ios_url: string; android_url: string; expires_in: number } | null>(null);
+   const [appLoading, setAppLoading] = useState(false);
+   const [appError, setAppError] = useState<string | null>(null);
+   const [appRemaining, setAppRemaining] = useState(0);
++  const [isMobile, setIsMobile] = useState(false);
++  useEffect(() => {
++    setIsMobile(/iphone|ipad|ipod|android/i.test(navigator.userAgent));
++  }, []);
+   const loadAppToken = useCallback(() => {
+     setAppLoading(true);
+     setAppError(null);
+@@ -128,7 +132,7 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+       .then((r) => (r.ok ? r.json() : Promise.reject(new Error("failed"))))
+       .then((d) => {
+         const ttl = Number(d.expires_in) || 180;
+-        setAppQr({ qr: d.qr, pairing_code: d.pairing_code, auto_renew: d.auto_renew === "true", ios_url: d.ios_url, android_url: d.android_url, expires_in: ttl });
++        setAppQr({ qr: d.qr, pairing_code: d.pairing_code, app_link: d.app_link, auto_renew: d.auto_renew === "true", ios_url: d.ios_url, android_url: d.android_url, expires_in: ttl });
+         setAppRemaining(ttl);
+       })
+       .catch(() => setAppError("QR-Code konnte nicht geladen werden."))
+@@ -886,6 +890,14 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+                   Scannen Sie diesen Code mit der <strong>EEG GrünLicht App</strong> — oder tippen Sie
+                   den Code darunter ein.
+                 </p>
++                {isMobile && appQr.app_link && (
++                  <a
++                    href={appQr.app_link}
++                    className="w-full text-center px-4 py-3 text-sm font-semibold rounded-lg bg-green-700 text-white hover:bg-green-800 transition-colors"
++                  >
++                    In der EEG GrünLicht App öffnen
++                  </a>
++                )}
+                 {/* eslint-disable-next-line @next/next/no-img-element */}
+                 <img
+                   src={appQr.qr}
+diff --git a/web/next.config.mjs b/web/next.config.mjs
+index 8c8bab6..3e34234 100644
+--- a/web/next.config.mjs
++++ b/web/next.config.mjs
+@@ -1,6 +1,12 @@
+ /** @type {import('next').NextConfig} */
+ const nextConfig = {
+   output: "standalone",
++  async rewrites() {
++    return [
++      { source: "/.well-known/apple-app-site-association", destination: "/api/well-known/aasa" },
++      { source: "/.well-known/assetlinks.json", destination: "/api/well-known/assetlinks" },
++    ];
++  },
+ };
+ 
+ export default nextConfig;

@@ -1,0 +1,516 @@
+diff --git a/api/cmd/server/main.go b/api/cmd/server/main.go
+index 02c917e..34c702c 100644
+--- a/api/cmd/server/main.go
++++ b/api/cmd/server/main.go
+@@ -138,6 +138,16 @@ func main() {
+ 	}()
+ 
+ 	portalRepo := repository.NewMemberPortalRepository(pool)
++
++	// Background: purge expired app login tokens (hourly).
++	go func() {
++		ticker := time.NewTicker(time.Hour)
++		defer ticker.Stop()
++		for {
++			_, _ = portalRepo.DeleteExpiredAppLoginTokens(ctx)
++			<-ticker.C
++		}
++	}()
+ 	portalHandler := handler.NewMemberPortalHandler(portalRepo, memberRepo, meterPointRepo, participationRepo, readingRepo, invoiceRepo, eegRepo, edaProcessRepo, jobRepo, emailLogRepo, webBaseURL)
+ 
+ 	memberEmailHandler := handler.NewMemberEmailHandler(memberEmailRepo, memberRepo, eegRepo, emailLogRepo)
+@@ -194,6 +204,7 @@ func main() {
+ 	r.Get("/api/v1/public/portal/documents/{docID}", eegDocumentHandler.PortalDownloadDocument)
+ 	r.Get("/api/v1/public/portal/meter-points", portalHandler.GetMeterPoints)
+ 	r.Post("/api/v1/public/portal/change-factor", portalHandler.ChangeParticipationFactor)
++	r.Get("/api/v1/public/portal/app-token", portalHandler.GetAppToken)
+ 	r.Post("/api/v1/public/portal/sepa-mandate", portalHandler.ChangeSepaMandate)
+ 	r.With(portalLimiter.Middleware).Post("/api/v1/public/portal/email-change", portalHandler.RequestEmailChange)
+ 	r.Post("/api/v1/public/portal/email-change/confirm/{token}", portalHandler.ConfirmEmailChange)
+diff --git a/api/go.mod b/api/go.mod
+index e58ff53..5306c41 100644
+--- a/api/go.mod
++++ b/api/go.mod
+@@ -12,6 +12,7 @@ require (
+ 	github.com/golang-migrate/migrate/v4 v4.17.1
+ 	github.com/google/uuid v1.6.0
+ 	github.com/jackc/pgx/v5 v5.6.0
++	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
+ 	github.com/swaggo/http-swagger/v2 v2.0.2
+ 	github.com/swaggo/swag v1.16.4
+ 	github.com/xuri/excelize/v2 v2.8.1
+diff --git a/api/go.sum b/api/go.sum
+index 746fe47..2094656 100644
+--- a/api/go.sum
++++ b/api/go.sum
+@@ -175,3 +175,5 @@ gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c/go.mod h1:K4uyk7z7BCEPqu6E+C
+ gopkg.in/yaml.v3 v3.0.0-20200615113413-eeeca48fe776/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+ gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
+ gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
++github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e h1:MRM5ITcdelLK2j1vwZ3Je0FKVCfqOLp5zO6trqMLYs0=
++github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e/go.mod h1:XV66xRDqSt+GTGFMVlhk3ULuV0y9ZmzeVGR4mloJI3M=
+diff --git a/api/internal/db/migrations/088_app_login_tokens.down.sql b/api/internal/db/migrations/088_app_login_tokens.down.sql
+new file mode 100644
+index 0000000..8b1fd22
+--- /dev/null
++++ b/api/internal/db/migrations/088_app_login_tokens.down.sql
+@@ -0,0 +1 @@
++DROP TABLE IF EXISTS app_login_tokens;
+diff --git a/api/internal/db/migrations/088_app_login_tokens.up.sql b/api/internal/db/migrations/088_app_login_tokens.up.sql
+new file mode 100644
+index 0000000..d0191a3
+--- /dev/null
++++ b/api/internal/db/migrations/088_app_login_tokens.up.sql
+@@ -0,0 +1,11 @@
++-- Short-lived login tokens for the GrünLicht mobile app QR code.
++-- SECURITY: only the SHA-256 hex hash of the token is stored — never the plaintext.
++CREATE TABLE IF NOT EXISTS app_login_tokens (
++    id          uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
++    token_hash  text        NOT NULL UNIQUE,
++    member_id   uuid        NOT NULL REFERENCES members(id) ON DELETE CASCADE,
++    expires_at  timestamptz NOT NULL,
++    created_at  timestamptz NOT NULL DEFAULT now()
++);
++
++CREATE INDEX IF NOT EXISTS idx_app_login_tokens_expires_at ON app_login_tokens (expires_at);
+diff --git a/api/internal/handler/portal_app_token.go b/api/internal/handler/portal_app_token.go
+new file mode 100644
+index 0000000..f3f011b
+--- /dev/null
++++ b/api/internal/handler/portal_app_token.go
+@@ -0,0 +1,222 @@
++package handler
++
++import (
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/sha256"
++	"encoding/base64"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"math/big"
++	"net/http"
++	"os"
++	"strconv"
++	"strings"
++	"time"
++
++	qrcode "github.com/skip2/go-qrcode"
++)
++
++// Env vars for the member-portal "App verbinden" QR feature. Configure these on
++// the API deployment (same place as the DID / signing key).
++const (
++	envAppQRKid      = "PORTAL_APP_QR_KID"          // JWT header kid, e.g. did:oyd:...#key-doc
++	envAppQRPrivKey  = "PORTAL_APP_QR_PRIVKEY"      // ES256 private key, multibase encoded
++	envAppQRTTL      = "PORTAL_APP_QR_TTL_SECONDS"  // token lifetime in seconds (default 180)
++	envAppIOSURL     = "PORTAL_APP_IOS_URL"         // App Store link
++	envAppAndroidURL = "PORTAL_APP_ANDROID_URL"     // Play Store link
++)
++
++// defaultAppQRTTLSeconds is the fallback token lifetime when PORTAL_APP_QR_TTL_SECONDS
++// is unset or invalid. The QR is scanned immediately, so a few minutes is plenty.
++const defaultAppQRTTLSeconds = 180
++
++// GetAppToken issues a signed ES256 JWT for the logged-in portal member and
++// returns it together with a QR-code image (PNG data URL) and the app store links.
++// Router: GET /api/v1/public/portal/app-token  (X-Portal-Session auth)
++func (h *MemberPortalHandler) GetAppToken(w http.ResponseWriter, r *http.Request) {
++	memberID, _, ok := h.portalAuth(r)
++	if !ok {
++		jsonError(w, "unauthorized", http.StatusUnauthorized)
++		return
++	}
++
++	kid := strings.TrimSpace(os.Getenv(envAppQRKid))
++	privMB := strings.TrimSpace(os.Getenv(envAppQRPrivKey))
++	if kid == "" || privMB == "" {
++		jsonError(w, "app connect not configured", http.StatusServiceUnavailable)
++		return
++	}
++
++	priv, err := parseP256PrivKeyMultibase(privMB)
++	if err != nil {
++		jsonError(w, "app signing key error: "+err.Error(), http.StatusInternalServerError)
++		return
++	}
++
++	ttl := appTokenTTL()
++
++	// Random login token (CSPRNG, 32 bytes). The plaintext lives ONLY inside the QR code:
++	// it is never persisted and never logged — the DB only ever stores its SHA-256 hash.
++	rawTok := make([]byte, 32)
++	if _, err := rand.Read(rawTok); err != nil {
++		jsonError(w, "failed to generate login token", http.StatusInternalServerError)
++		return
++	}
++	loginToken := base64.RawURLEncoding.EncodeToString(rawTok)
++	sum := sha256.Sum256([]byte(loginToken))
++	tokenHash := hex.EncodeToString(sum[:])
++
++	if err := h.portalRepo.CreateAppLoginToken(r.Context(), tokenHash, memberID, int(ttl.Seconds())); err != nil {
++		jsonError(w, "failed to store login token", http.StatusInternalServerError)
++		return
++	}
++
++	jwtStr, err := signAppJWT(priv, kid, loginToken, ttl)
++	if err != nil {
++		jsonError(w, "failed to sign token", http.StatusInternalServerError)
++		return
++	}
++
++	png, err := qrcode.Encode(jwtStr, qrcode.Medium, 320)
++	if err != nil {
++		jsonError(w, "failed to render qr", http.StatusInternalServerError)
++		return
++	}
++
++	// The signed JWT (and thus the login token) is deliberately NOT returned in the JSON
++	// body — it exists only inside the rendered QR image.
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(map[string]string{
++		"qr":          "data:image/png;base64," + base64.StdEncoding.EncodeToString(png),
++		"ios_url":     strings.TrimSpace(os.Getenv(envAppIOSURL)),
++		"android_url": strings.TrimSpace(os.Getenv(envAppAndroidURL)),
++		"expires_in":  strconv.Itoa(int(ttl.Seconds())),
++	})
++}
++
++// appTokenTTL reads PORTAL_APP_QR_TTL_SECONDS, falling back to the default when
++// unset, non-numeric or <= 0.
++func appTokenTTL() time.Duration {
++	if v := strings.TrimSpace(os.Getenv(envAppQRTTL)); v != "" {
++		if n, err := strconv.Atoi(v); err == nil && n > 0 {
++			return time.Duration(n) * time.Second
++		}
++	}
++	return time.Duration(defaultAppQRTTLSeconds) * time.Second
++}
++
++// signAppJWT builds a compact ES256 JWT: header{alg,typ,kid}.payload{tok,iat,exp}.signature.
++// The payload carries ONLY a short-lived random token — no member identifier, no PII.
++func signAppJWT(priv *ecdsa.PrivateKey, kid, tok string, ttl time.Duration) (string, error) {
++	header := struct {
++		Alg string `json:"alg"`
++		Typ string `json:"typ"`
++		Kid string `json:"kid"`
++	}{Alg: "ES256", Typ: "JWT", Kid: kid}
++
++	now := time.Now().Unix()
++	payload := struct {
++		Tok string `json:"tok"`
++		Iat int64  `json:"iat"`
++		Exp int64  `json:"exp"`
++	}{Tok: tok, Iat: now, Exp: now + int64(ttl.Seconds())}
++
++	hb, err := json.Marshal(header)
++	if err != nil {
++		return "", err
++	}
++	pb, err := json.Marshal(payload)
++	if err != nil {
++		return "", err
++	}
++	b64 := base64.RawURLEncoding
++	signingInput := b64.EncodeToString(hb) + "." + b64.EncodeToString(pb)
++
++	digest := sha256.Sum256([]byte(signingInput))
++	rInt, sInt, err := ecdsa.Sign(rand.Reader, priv, digest[:])
++	if err != nil {
++		return "", err
++	}
++	// ES256 signature = R || S, each left-padded to 32 bytes.
++	sig := make([]byte, 64)
++	rInt.FillBytes(sig[0:32])
++	sInt.FillBytes(sig[32:64])
++	return signingInput + "." + b64.EncodeToString(sig), nil
++}
++
++// parseP256PrivKeyMultibase decodes a multibase-encoded private key and returns
++// the P-256 private key. The 32-byte private scalar is taken as the LAST 32 bytes
++// of the decoded value, so any preceding multibase/multicodec prefix is tolerated
++// (standard p256-priv 0x1306, OYD's 2-byte-codec+length prefix, or a raw scalar).
++func parseP256PrivKeyMultibase(mb string) (*ecdsa.PrivateKey, error) {
++	raw, err := decodeMultibase(strings.TrimSpace(mb))
++	if err != nil {
++		return nil, err
++	}
++	if len(raw) < 32 {
++		return nil, fmt.Errorf("decoded key too short: %d bytes", len(raw))
++	}
++	scalar := raw[len(raw)-32:]
++	priv := new(ecdsa.PrivateKey)
++	priv.Curve = elliptic.P256()
++	priv.D = new(big.Int).SetBytes(scalar)
++	priv.PublicKey.X, priv.PublicKey.Y = priv.Curve.ScalarBaseMult(scalar)
++	return priv, nil
++}
++
++// decodeMultibase decodes the common multibase encodings by their prefix char
++// (z=base58btc, u/U=base64url, m/M=base64, f/F=base16).
++func decodeMultibase(s string) ([]byte, error) {
++	if s == "" {
++		return nil, fmt.Errorf("empty multibase string")
++	}
++	prefix, rest := s[0], s[1:]
++	switch prefix {
++	case 'z':
++		return base58Decode(rest)
++	case 'u':
++		return base64.RawURLEncoding.DecodeString(rest)
++	case 'U':
++		return base64.URLEncoding.DecodeString(rest)
++	case 'm':
++		return base64.RawStdEncoding.DecodeString(rest)
++	case 'M':
++		return base64.StdEncoding.DecodeString(rest)
++	case 'f':
++		return hex.DecodeString(rest)
++	case 'F':
++		return hex.DecodeString(strings.ToLower(rest))
++	default:
++		return nil, fmt.Errorf("unsupported multibase prefix %q", string(prefix))
++	}
++}
++
++// base58Decode decodes a base58btc (Bitcoin alphabet) string.
++func base58Decode(s string) ([]byte, error) {
++	const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
++	result := big.NewInt(0)
++	radix := big.NewInt(58)
++	for _, c := range s {
++		idx := strings.IndexRune(alphabet, c)
++		if idx < 0 {
++			return nil, fmt.Errorf("invalid base58 char %q", string(c))
++		}
++		result.Mul(result, radix)
++		result.Add(result, big.NewInt(int64(idx)))
++	}
++	decoded := result.Bytes()
++	leading := 0
++	for _, c := range s {
++		if c == '1' {
++			leading++
++		} else {
++			break
++		}
++	}
++	out := make([]byte, leading+len(decoded))
++	copy(out[leading:], decoded)
++	return out, nil
++}
+diff --git a/api/internal/repository/member_portal.go b/api/internal/repository/member_portal.go
+index f7616fe..dfebc46 100644
+--- a/api/internal/repository/member_portal.go
++++ b/api/internal/repository/member_portal.go
+@@ -206,3 +206,25 @@ func (r *MemberPortalRepository) ConfirmEmailChange(ctx context.Context, v *Emai
+ 
+ 	return oldEmail, tx.Commit(ctx)
+ }
++
++// CreateAppLoginToken stores the SHA-256 hash of a freshly minted app login token.
++// SECURITY: the plaintext token is NEVER persisted and NEVER logged — it exists only
++// inside the QR code shown to the member. Billing does not mark tokens as consumed;
++// single-use is enforced by the GrünLicht API in its own database, so the API can stay
++// strictly read-only on this database.
++func (r *MemberPortalRepository) CreateAppLoginToken(ctx context.Context, tokenHash string, memberID uuid.UUID, ttlSeconds int) error {
++	_, err := r.db.Exec(ctx,
++		`INSERT INTO app_login_tokens (token_hash, member_id, expires_at)
++		 VALUES ($1, $2, now() + make_interval(secs => $3))`,
++		tokenHash, memberID, ttlSeconds)
++	return err
++}
++
++// DeleteExpiredAppLoginTokens purges tokens past their expiry. Returns the number of rows removed.
++func (r *MemberPortalRepository) DeleteExpiredAppLoginTokens(ctx context.Context) (int64, error) {
++	tag, err := r.db.Exec(ctx, `DELETE FROM app_login_tokens WHERE expires_at < now()`)
++	if err != nil {
++		return 0, err
++	}
++	return tag.RowsAffected(), nil
++}
+diff --git a/web/app/api/portal/app-token/route.ts b/web/app/api/portal/app-token/route.ts
+new file mode 100644
+index 0000000..c099be4
+--- /dev/null
++++ b/web/app/api/portal/app-token/route.ts
+@@ -0,0 +1,15 @@
++import { cookies } from "next/headers";
++const API = process.env.API_INTERNAL_URL || "http://localhost:8080";
++
++export async function GET() {
++  const cookieStore = await cookies();
++  const sessionToken = cookieStore.get("portal_session")?.value;
++  if (!sessionToken) return Response.json({ error: "Unauthorized" }, { status: 401 });
++
++  const res = await fetch(`${API}/api/v1/public/portal/app-token`, {
++    headers: { "X-Portal-Session": sessionToken },
++    cache: "no-store",
++  });
++  if (!res.ok) return Response.json({ error: "upstream error" }, { status: res.status });
++  return Response.json(await res.json(), { status: res.status });
++}
+diff --git a/web/app/portal/dashboard/PortalDashboardClient.tsx b/web/app/portal/dashboard/PortalDashboardClient.tsx
+index 34b646f..40efb02 100644
+--- a/web/app/portal/dashboard/PortalDashboardClient.tsx
++++ b/web/app/portal/dashboard/PortalDashboardClient.tsx
+@@ -1,6 +1,6 @@
+ "use client";
+ 
+-import { useState, useEffect } from "react";
++import { useState, useEffect, useCallback } from "react";
+ import dynamic from "next/dynamic";
+ 
+ const PortalEnergyChart = dynamic(() => import("./PortalEnergyChart"), { ssr: false });
+@@ -116,7 +116,32 @@ interface Props {
+ }
+ 
+ export default function PortalDashboardClient({ member, eeg, invoices, documents, meterPoints, showFullEnergy }: Props) {
+-  const [activeTab, setActiveTab] = useState<"energy" | "invoices" | "downloads" | "zaehlpunkte" | "profil">("energy");
++  const [activeTab, setActiveTab] = useState<"energy" | "invoices" | "downloads" | "zaehlpunkte" | "profil" | "app">("energy");
++  const [appQr, setAppQr] = useState<{ qr: string; ios_url: string; android_url: string; expires_in: number } | null>(null);
++  const [appLoading, setAppLoading] = useState(false);
++  const [appError, setAppError] = useState<string | null>(null);
++  const [appRemaining, setAppRemaining] = useState(0);
++  const loadAppToken = useCallback(() => {
++    setAppLoading(true);
++    setAppError(null);
++    fetch("/api/portal/app-token")
++      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("failed"))))
++      .then((d) => {
++        const ttl = Number(d.expires_in) || 180;
++        setAppQr({ qr: d.qr, ios_url: d.ios_url, android_url: d.android_url, expires_in: ttl });
++        setAppRemaining(ttl);
++      })
++      .catch(() => setAppError("QR-Code konnte nicht geladen werden."))
++      .finally(() => setAppLoading(false));
++  }, []);
++  useEffect(() => {
++    if (activeTab === "app" && !appQr && !appLoading && !appError) loadAppToken();
++  }, [activeTab, appQr, appLoading, appError, loadAppToken]);
++  useEffect(() => {
++    if (!appQr || appRemaining <= 0) return;
++    const id = setTimeout(() => setAppRemaining((sec) => Math.max(0, sec - 1)), 1000);
++    return () => clearTimeout(id);
++  }, [appQr, appRemaining]);
+   const [currentIban, setCurrentIban] = useState(member.iban || "");
+   const [editingIban, setEditingIban] = useState(false);
+   const [newIban, setNewIban] = useState("");
+@@ -411,6 +436,14 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+           >
+             Profil
+           </button>
++          <button
++            onClick={() => setActiveTab("app")}
++            className={`px-4 py-1.5 text-sm font-medium rounded-md transition-colors ${
++              activeTab === "app" ? "bg-white text-slate-900 shadow-sm" : "text-slate-600 hover:text-slate-900"
++            }`}
++          >
++            App verbinden
++          </button>
+         </div>
+ 
+         {/* Energy Tab */}
+@@ -604,6 +637,100 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+           </div>
+         )}
+ 
++        {/* App verbinden Tab */}
++        {activeTab === "app" && (
++          <div className="max-w-md space-y-5">
++            <div className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
++              <p className="text-sm font-medium text-amber-900">Funktion in Entwicklung</p>
++              <p className="text-xs text-amber-800 mt-1">
++                Diese Funktion wird gerade entwickelt und ist noch nicht allgemein verfügbar. Die „EEG
++                GrünLicht App“ wird voraussichtlich <strong>Ende August</strong> in den App Stores zum
++                Download bereitstehen.
++              </p>
++            </div>
++            <div>
++              <h2 className="text-lg font-semibold text-slate-900">App verbinden</h2>
++              <p className="text-sm text-slate-600 mt-1">
++                Scannen Sie diesen QR-Code mit der <strong>EEG GrünLicht App</strong>, um sich in der App anzumelden.
++              </p>
++            </div>
++            {appLoading && !appQr && <p className="text-sm text-slate-500">QR-Code wird geladen …</p>}
++            {appError && !appQr && (
++              <div className="space-y-2">
++                <p className="text-sm text-red-600">{appError}</p>
++                <button
++                  onClick={loadAppToken}
++                  className="px-4 py-2 text-sm font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 transition-colors"
++                >
++                  Erneut versuchen
++                </button>
++              </div>
++            )}
++            {appQr && (
++              <div className="flex flex-col items-center gap-4">
++                <div className="relative">
++                  {/* eslint-disable-next-line @next/next/no-img-element */}
++                  <img
++                    src={appQr.qr}
++                    alt="QR-Code zum Verbinden der App"
++                    className={`w-64 h-64 rounded-xl border border-slate-200 bg-white p-3 transition-all ${
++                      appRemaining <= 0 ? "opacity-20 blur-sm" : ""
++                    }`}
++                  />
++                  {appRemaining <= 0 && (
++                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
++                      <span className="text-sm font-semibold text-slate-700">Code abgelaufen</span>
++                      <button
++                        onClick={loadAppToken}
++                        disabled={appLoading}
++                        className="px-4 py-2 text-sm font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 transition-colors disabled:opacity-60"
++                      >
++                        Neuen Code laden
++                      </button>
++                    </div>
++                  )}
++                </div>
++                {appRemaining > 0 ? (
++                  <p className="text-xs text-slate-500 text-center">
++                    Aus Sicherheitsgründen ist der Code nur noch{" "}
++                    <span className="font-medium text-slate-700 tabular-nums">
++                      {Math.floor(appRemaining / 60)}:{String(appRemaining % 60).padStart(2, "0")}
++                    </span>{" "}
++                    gültig. Danach bitte neu laden.
++                  </p>
++                ) : (
++                  <p className="text-xs text-red-600 text-center">Der Code ist abgelaufen. Bitte neuen Code laden.</p>
++                )}
++                <div className="flex gap-3 flex-wrap justify-center">
++                  {appQr.ios_url && (
++                    <a
++                      href={appQr.ios_url}
++                      target="_blank"
++                      rel="noopener noreferrer"
++                      className="px-4 py-2 text-sm font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 transition-colors"
++                    >
++                      App Store (iOS)
++                    </a>
++                  )}
++                  {appQr.android_url && (
++                    <a
++                      href={appQr.android_url}
++                      target="_blank"
++                      rel="noopener noreferrer"
++                      className="px-4 py-2 text-sm font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 transition-colors"
++                    >
++                      Play Store (Android)
++                    </a>
++                  )}
++                </div>
++                <p className="text-xs text-slate-400 text-center">
++                  Noch keine App? Laden Sie die „EEG GrünLicht App“ über die Links oben.
++                </p>
++              </div>
++            )}
++          </div>
++        )}
++
+         {/* Zählpunkte Tab */}
+         {activeTab === "zaehlpunkte" && (
+           <div className="space-y-4">

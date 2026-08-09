@@ -1,0 +1,126 @@
+diff --git a/web/components/billing-run-form.tsx b/web/components/billing-run-form.tsx
+--- a/web/components/billing-run-form.tsx
++++ b/web/components/billing-run-form.tsx
+@@ -186,8 +186,42 @@
+ 
+   const memberLabel = (m: Member) => [m.name1, m.name2].filter(Boolean).join(" ") || m.name || m.id;
+   const memberMap = new Map(members.map(m => [m.id, memberLabel(m)]));
++  const memberById = new Map(members.map((m) => [m.id, m]));
+   const fmtDate = (d: string) => new Date(d).toLocaleDateString("de-AT");
+ 
++  // Energierichtung eines Zählpunkts einordnen (gleiche Logik wie Mitglieder-Tabelle).
++  const dirIsConsumption = (d: string) =>
++    !!d && (d.toLowerCase().includes("consume") || d.toLowerCase() === "bezug" || d === "CONSUMPTION");
++  const dirIsGeneration = (d: string) =>
++    !!d && (d.toLowerCase().includes("produc") || d.toLowerCase() === "einspeisung" || d === "GENERATION");
++
++  // Typ aus den Zählpunkt-Richtungen ableiten: Bezug + Einspeisung = Prosumer.
++  const memberTyp = (m?: Member): string => {
++    const mps = m?.meter_points ?? [];
++    if (mps.length === 0) return "—";
++    const hasC = mps.some((mp) => dirIsConsumption(mp.direction));
++    const hasG = mps.some((mp) => dirIsGeneration(mp.direction));
++    if (hasC && hasG) return "Prosumer";
++    if (hasG) return "Einspeiser";
++    return "Verbraucher";
++  };
++
++  // Straßenname ohne Hausnummer und ohne Ort/PLZ: alles ab dem ersten " <Ziffer>" abschneiden.
++  const streetName = (strasse?: string): string =>
++    (strasse ?? "").replace(/\s+\d.*$/, "").trim();
++
++  const memberZaehlpunkte = (m?: Member): string[] =>
++    (m?.meter_points ?? []).map((mp) => mp.meter_id).filter(Boolean);
++
++  // Zahl mit Komma-Dezimaltrenner, damit Excel (de) sie beim Einfuegen als Zahl erkennt
++  // (statt z. B. "11.25" als Datum zu interpretieren).
++  const num2 = (v: number): string => (v ?? 0).toFixed(2).replace(".", ",");
++  // Mitgliedsnummer (fuer Sortierung).
++  const memberNr = (id: string): string => {
++    const m = memberById.get(id);
++    return m?.member_number || m?.mitglieds_nr || "";
++  };
++
+   return (
+     <div className="bg-white rounded-xl border border-slate-200 p-6">
+       <div className="flex items-start gap-4 mb-5">
+@@ -224,40 +258,60 @@
+       {previewResult && (
+         <div className="mb-5 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+           <p className="font-medium text-blue-800 mb-2">Vorschau ({previewResult.count} Rechnungen — nicht gespeichert)</p>
++          <div className="overflow-x-auto">
+           <table className="w-full text-xs text-blue-900">
+             <thead>
+               <tr className="border-b border-blue-200">
+-                <th className="text-left py-1">Mitglied</th>
+-                <th className="text-right py-1">Bezug kWh</th>
+-                <th className="text-right py-1">Einspeisung kWh</th>
+-                <th className="text-right py-1">Betrag</th>
++                <th className="text-left py-1 pr-3">MitgliedsNr</th>
++                <th className="text-left py-1 pr-3">Typ</th>
++                <th className="text-left py-1 pr-3">Zählpunkt(e)</th>
++                <th className="text-left py-1 pr-3">Name &amp; Adresse</th>
++                <th className="text-right py-1 pl-3">Bezug kWh</th>
++                <th className="text-right py-1 pl-3">Einspeisung kWh</th>
++                <th className="text-right py-1 pl-3">Betrag (€)</th>
+               </tr>
+             </thead>
+             <tbody>
+-              {previewResult.invoices.map((inv, i) => (
+-                <tr key={i} className="border-b border-blue-100">
+-                  <td className="py-1">{memberMap.get(inv.member_id) ?? inv.member_id.slice(0, 8)}</td>
+-                  <td className="py-1 text-right">{inv.consumption_kwh?.toFixed(2)}</td>
+-                  <td className="py-1 text-right">{inv.generation_kwh?.toFixed(2)}</td>
+-                  <td className="py-1 text-right font-medium">{previewZahlBetrag(inv).toFixed(2)} €</td>
+-                </tr>
+-              ))}
++              {[...previewResult.invoices]
++                .sort((a, b) => memberNr(a.member_id).localeCompare(memberNr(b.member_id), undefined, { numeric: true }))
++                .map((inv, i) => {
++                const m = memberById.get(inv.member_id);
++                const zps = memberZaehlpunkte(m);
++                const strasse = streetName(m?.strasse);
++                return (
++                  <tr key={i} className="border-b border-blue-100 align-top">
++                    <td className="py-1 pr-3 font-mono">{m?.member_number || m?.mitglieds_nr || "—"}</td>
++                    <td className="py-1 pr-3">{memberTyp(m)}</td>
++                    <td className="py-1 pr-3 font-mono">
++                      {zps.length > 0 ? zps.join(", ") : "—"}
++                    </td>
++                    <td className="py-1 pr-3">
++                      <span className="font-medium">{memberMap.get(inv.member_id) ?? inv.member_id.slice(0, 8)}</span>
++                      {strasse && <span className="text-blue-700/70"> · {strasse}</span>}
++                    </td>
++                    <td className="py-1 pl-3 text-right">{num2(inv.consumption_kwh ?? 0)}</td>
++                    <td className="py-1 pl-3 text-right">{num2(inv.generation_kwh ?? 0)}</td>
++                    <td className="py-1 pl-3 text-right font-medium">{num2(previewZahlBetrag(inv))}</td>
++                  </tr>
++                );
++              })}
+             </tbody>
+             <tfoot>
+               <tr className="border-t border-blue-300 font-semibold">
+-                <td className="py-1">Gesamt</td>
+-                <td className="py-1 text-right">
+-                  {previewResult.invoices.reduce((s, inv) => s + (inv.consumption_kwh ?? 0), 0).toFixed(2)}
++                <td className="py-1" colSpan={4}>Gesamt</td>
++                <td className="py-1 pl-3 text-right">
++                  {num2(previewResult.invoices.reduce((s, inv) => s + (inv.consumption_kwh ?? 0), 0))}
+                 </td>
+-                <td className="py-1 text-right">
+-                  {previewResult.invoices.reduce((s, inv) => s + (inv.generation_kwh ?? 0), 0).toFixed(2)}
++                <td className="py-1 pl-3 text-right">
++                  {num2(previewResult.invoices.reduce((s, inv) => s + (inv.generation_kwh ?? 0), 0))}
+                 </td>
+-                <td className="py-1 text-right">
+-                  {previewResult.invoices.reduce((s, inv) => s + previewZahlBetrag(inv), 0).toFixed(2)} €
++                <td className="py-1 pl-3 text-right">
++                  {num2(previewResult.invoices.reduce((s, inv) => s + previewZahlBetrag(inv), 0))}
+                 </td>
+               </tr>
+             </tfoot>
+           </table>
++          </div>
+           <p className="text-xs text-blue-600 mt-2">Klicken Sie auf &quot;Abrechnung starten&quot; um fortzufahren.</p>
+         </div>
+       )}

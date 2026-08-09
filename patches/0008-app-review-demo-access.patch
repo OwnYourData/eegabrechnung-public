@@ -1,0 +1,277 @@
+diff --git a/api/cmd/server/main.go b/api/cmd/server/main.go
+index 7d503bd..ee0af87 100644
+--- a/api/cmd/server/main.go
++++ b/api/cmd/server/main.go
+@@ -203,15 +203,16 @@ func main() {
+ 	r.Get("/api/v1/public/portal/documents", eegDocumentHandler.PortalListDocuments)
+ 	r.Get("/api/v1/public/portal/documents/{docID}", eegDocumentHandler.PortalDownloadDocument)
+ 	r.Get("/api/v1/public/portal/meter-points", portalHandler.GetMeterPoints)
+-	r.Post("/api/v1/public/portal/change-factor", portalHandler.ChangeParticipationFactor)
++	r.With(portalHandler.DenyDemoMember).Post("/api/v1/public/portal/change-factor", portalHandler.ChangeParticipationFactor)
++	r.With(portalLimiter.Middleware).Post("/api/v1/public/portal/review-exchange", portalHandler.ReviewExchange)
+ 	r.Get("/api/v1/public/portal/app-token", portalHandler.GetAppToken)
+ 	r.Get("/api/v1/public/portal/app-pairings", portalHandler.GetAppPairings)
+ 	r.Post("/api/v1/public/portal/app-pairings/{pairingID}/confirm", portalHandler.ConfirmAppPairing)
+ 	r.Post("/api/v1/public/portal/app-pairings/{pairingID}/reject", portalHandler.RejectAppPairing)
+ 	r.Get("/api/v1/public/portal/app-sessions", portalHandler.GetAppSessions)
+ 	r.Delete("/api/v1/public/portal/app-sessions/{sessionID}", portalHandler.RevokeAppSession)
+-	r.Post("/api/v1/public/portal/sepa-mandate", portalHandler.ChangeSepaMandate)
+-	r.With(portalLimiter.Middleware).Post("/api/v1/public/portal/email-change", portalHandler.RequestEmailChange)
++	r.With(portalHandler.DenyDemoMember).Post("/api/v1/public/portal/sepa-mandate", portalHandler.ChangeSepaMandate)
++	r.With(portalLimiter.Middleware, portalHandler.DenyDemoMember).Post("/api/v1/public/portal/email-change", portalHandler.RequestEmailChange)
+ 	r.Post("/api/v1/public/portal/email-change/confirm/{token}", portalHandler.ConfirmEmailChange)
+ 
+ 	authMiddleware := auth.Middleware(jwtSecret)
+diff --git a/api/internal/db/migrations/089_member_demo_flag.down.sql b/api/internal/db/migrations/089_member_demo_flag.down.sql
+new file mode 100644
+index 0000000..d3a01c4
+--- /dev/null
++++ b/api/internal/db/migrations/089_member_demo_flag.down.sql
+@@ -0,0 +1,2 @@
++DROP INDEX IF EXISTS idx_members_single_demo;
++ALTER TABLE members DROP COLUMN IF EXISTS is_demo;
+diff --git a/api/internal/db/migrations/089_member_demo_flag.up.sql b/api/internal/db/migrations/089_member_demo_flag.up.sql
+new file mode 100644
+index 0000000..626fbba
+--- /dev/null
++++ b/api/internal/db/migrations/089_member_demo_flag.up.sql
+@@ -0,0 +1,6 @@
++-- Demo-Mitglied für die Apple-Beta-Review (TestFlight). Genau EIN Konto darf so
++-- markiert sein — der partielle Unique-Index erzwingt das.
++ALTER TABLE members ADD COLUMN IF NOT EXISTS is_demo BOOLEAN NOT NULL DEFAULT false;
++
++CREATE UNIQUE INDEX IF NOT EXISTS idx_members_single_demo
++    ON members (is_demo) WHERE is_demo = true;
+diff --git a/api/internal/handler/portal_app_review.go b/api/internal/handler/portal_app_review.go
+new file mode 100644
+index 0000000..7e84c16
+--- /dev/null
++++ b/api/internal/handler/portal_app_review.go
+@@ -0,0 +1,118 @@
++package handler
++
++import (
++	"crypto/subtle"
++	"encoding/json"
++	"log/slog"
++	"net/http"
++	"os"
++	"strings"
++)
++
++// Apple-Beta-Review (TestFlight) — dauerhafter Demo-Zugang, rein serverseitig.
++// Die App bekommt KEINEN Demo-Modus und keine Backdoor.
++const (
++	envAppReviewEnabled = "APP_REVIEW_ENABLED" // "true" schaltet den Link scharf; sonst 404
++	envAppReviewToken   = "APP_REVIEW_TOKEN"   // >= 32 Byte Zufall, jederzeit rotierbar
++)
++
++const appReviewMinTokenLen = 32
++
++// reviewEnabled reports whether the review link is armed.
++func reviewEnabled() bool {
++	return strings.EqualFold(strings.TrimSpace(os.Getenv(envAppReviewEnabled)), "true")
++}
++
++// ReviewExchange trades the APP_REVIEW_TOKEN for a normal portal session of the demo
++// member. There is no special review page — only a special *account*, no special *path*.
++//
++// SECURITY:
++//   - Kill-switch: APP_REVIEW_ENABLED != true  -> 404 (link is dead).
++//   - Constant-time comparison of the shared token; any mismatch -> 404 (never reveal
++//     whether the endpoint exists or the token was merely wrong).
++//   - The token authenticates EXACTLY ONE account: the single member flagged is_demo.
++//     It can never select another member — the id comes from the DB, never from the request.
++//   - That account is read-only (see DenyDemoMember middleware).
++//
++// Router: POST /api/v1/public/portal/review-exchange  (IP rate limited)
++func (h *MemberPortalHandler) ReviewExchange(w http.ResponseWriter, r *http.Request) {
++	if !reviewEnabled() {
++		http.NotFound(w, r)
++		return
++	}
++	want := strings.TrimSpace(os.Getenv(envAppReviewToken))
++	if len(want) < appReviewMinTokenLen {
++		slog.Error("app review: APP_REVIEW_TOKEN missing or too short — link disabled")
++		http.NotFound(w, r)
++		return
++	}
++
++	var req struct {
++		Token string `json:"token"`
++	}
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
++		http.NotFound(w, r)
++		return
++	}
++	got := strings.TrimSpace(req.Token)
++	if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
++		slog.Warn("app review: invalid token presented",
++			"remote", r.RemoteAddr, "xff", r.Header.Get("X-Forwarded-For"))
++		http.NotFound(w, r)
++		return
++	}
++
++	// The demo member is resolved from the DB (is_demo), never from the request.
++	memberID, eegID, err := h.portalRepo.FindDemoMember(r.Context())
++	if err != nil {
++		slog.Error("app review: no demo member found (is_demo)", "error", err)
++		http.NotFound(w, r)
++		return
++	}
++
++	linkToken, err := h.portalRepo.CreateLinkSession(r.Context(), memberID, eegID)
++	if err != nil {
++		jsonError(w, "failed to create review session", http.StatusInternalServerError)
++		return
++	}
++	sessionToken, _, _, err := h.portalRepo.ExchangeLinkToken(r.Context(), linkToken)
++	if err != nil {
++		jsonError(w, "failed to create review session", http.StatusInternalServerError)
++		return
++	}
++
++	// Alert: der Review-Link wurde benutzt.
++	slog.Warn("app review link used",
++		"member_id", memberID.String(),
++		"remote", r.RemoteAddr,
++		"xff", r.Header.Get("X-Forwarded-For"),
++		"ua", r.UserAgent())
++
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(map[string]string{"session_token": sessionToken})
++}
++
++// DenyDemoMember blocks every write action for the review/demo account. The account is
++// strictly read-only: no master-data changes, no IBAN/SEPA, no e-mail change. Pairing
++// confirm/reject and revoking app sessions stay allowed — the reviewer needs exactly those.
++func (h *MemberPortalHandler) DenyDemoMember(next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		memberID, _, ok := h.portalAuth(r)
++		if !ok {
++			jsonError(w, "unauthorized", http.StatusUnauthorized)
++			return
++		}
++		demo, err := h.portalRepo.IsDemoMember(r.Context(), memberID)
++		if err != nil {
++			jsonError(w, "internal error", http.StatusInternalServerError)
++			return
++		}
++		if demo {
++			slog.Warn("app review: write attempt blocked for demo account",
++				"path", r.URL.Path, "member_id", memberID.String())
++			jsonError(w, "Der Demo-Zugang ist schreibgeschützt.", http.StatusForbidden)
++			return
++		}
++		next.ServeHTTP(w, r)
++	})
++}
+diff --git a/api/internal/repository/member_portal.go b/api/internal/repository/member_portal.go
+index dfebc46..ad224d7 100644
+--- a/api/internal/repository/member_portal.go
++++ b/api/internal/repository/member_portal.go
+@@ -228,3 +228,24 @@ func (r *MemberPortalRepository) DeleteExpiredAppLoginTokens(ctx context.Context
+ 	}
+ 	return tag.RowsAffected(), nil
+ }
++
++// FindDemoMember returns the single member flagged is_demo (the Apple review account).
++// A partial unique index guarantees there is at most one.
++func (r *MemberPortalRepository) FindDemoMember(ctx context.Context) (memberID, eegID uuid.UUID, err error) {
++	err = r.db.QueryRow(ctx,
++		`SELECT id, eeg_id FROM members WHERE is_demo = true LIMIT 1`,
++	).Scan(&memberID, &eegID)
++	return memberID, eegID, err
++}
++
++// IsDemoMember reports whether the member is the review/demo account. Used to keep
++// that account strictly read-only.
++func (r *MemberPortalRepository) IsDemoMember(ctx context.Context, memberID uuid.UUID) (bool, error) {
++	var demo bool
++	if err := r.db.QueryRow(ctx,
++		`SELECT is_demo FROM members WHERE id = $1`, memberID,
++	).Scan(&demo); err != nil {
++		return false, err
++	}
++	return demo, nil
++}
+diff --git a/web/app/portal/dashboard/PortalDashboardClient.tsx b/web/app/portal/dashboard/PortalDashboardClient.tsx
+index 6b1983f..fe6b236 100644
+--- a/web/app/portal/dashboard/PortalDashboardClient.tsx
++++ b/web/app/portal/dashboard/PortalDashboardClient.tsx
+@@ -143,6 +143,13 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+     return () => clearTimeout(id);
+   }, [appQr, appRemaining]);
+ 
++  // QR automatisch erneuern, sobald er abläuft (der Reviewer soll nie in einen
++  // abgelaufenen Code laufen). Kein Loop: während des Ladens greift der appLoading-Guard.
++  useEffect(() => {
++    if (activeTab !== "app" || !appQr || appRemaining > 0 || appLoading) return;
++    loadAppToken();
++  }, [activeTab, appQr, appRemaining, appLoading, loadAppToken]);
++
+   // ── App-Pairing (Bestätigung) + verbundene Geräte ────────────────────────────
+   const [pairing, setPairing] = useState<{ id: string; pairingCode: string; deviceLabel: string } | null>(null);
+   const [pairingBusy, setPairingBusy] = useState(false);
+diff --git a/web/app/portal/layout.tsx b/web/app/portal/layout.tsx
+index b3ecfe5..5009d2b 100644
+--- a/web/app/portal/layout.tsx
++++ b/web/app/portal/layout.tsx
+@@ -1,3 +1,8 @@
++
++// Das Mitgliederportal (inkl. Demo-/Review-Zugang) darf nicht indexiert werden.
++export const metadata = {
++  robots: { index: false, follow: false },
++};
+ export default function PortalLayout({ children }: { children: React.ReactNode }) {
+   return (
+     <div className="min-h-screen bg-slate-50">
+diff --git a/web/app/portal/review/route.ts b/web/app/portal/review/route.ts
+new file mode 100644
+index 0000000..3a309bf
+--- /dev/null
++++ b/web/app/portal/review/route.ts
+@@ -0,0 +1,43 @@
++import { NextRequest, NextResponse } from "next/server";
++
++const API = process.env.API_INTERNAL_URL || "http://localhost:8080";
++
++// Apple-Beta-Review-Einstieg: /portal/review?t=<APP_REVIEW_TOKEN>
++// Löst den Token serverseitig ein und meldet den Aufrufer im NORMALEN Portal als
++// Demo-Mitglied an. Keine Sonderseite — nur ein Sonder-Konto.
++export async function GET(request: NextRequest) {
++  const token = request.nextUrl.searchParams.get("t") ?? "";
++
++  const proto = request.headers.get("x-forwarded-proto") ?? "http";
++  const host =
++    request.headers.get("x-forwarded-host") ??
++    request.headers.get("host") ??
++    "localhost:3001";
++  const base = `${proto}://${host}`;
++
++  if (!token) return new NextResponse("Not found", { status: 404 });
++
++  const res = await fetch(`${API}/api/v1/public/portal/review-exchange`, {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ token }),
++    cache: "no-store",
++  });
++
++  // Kill-Switch oder falscher Token -> 404, nichts verraten.
++  if (!res.ok) return new NextResponse("Not found", { status: 404 });
++
++  const data = await res.json();
++  const sessionToken: string = data.session_token;
++
++  const response = NextResponse.redirect(`${base}/portal/dashboard`);
++  response.cookies.set("portal_session", sessionToken, {
++    httpOnly: true,
++    secure: process.env.NODE_ENV === "production",
++    sameSite: "lax",
++    maxAge: 24 * 60 * 60,
++    path: "/",
++  });
++  response.headers.set("X-Robots-Tag", "noindex, nofollow");
++  return response;
++}

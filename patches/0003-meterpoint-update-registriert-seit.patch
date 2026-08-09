@@ -1,0 +1,93 @@
+diff --git a/api/internal/handler/meter_point.go b/api/internal/handler/meter_point.go
+--- a/api/internal/handler/meter_point.go	2026-07-06 14:26:47.163000222 +0200
++++ b/api/internal/handler/meter_point.go	2026-07-06 14:26:47.187000222 +0200
+@@ -214,6 +214,18 @@
+ 		existing.AbgemeldetAm = &t
+ 	}
+ 
++	// Manuelles Setzen/Korrigieren des Aktivierungsdatums (registriert_seit) ueber die UI.
++	registriertSeitChanged := false
++	if req.RegistriertSeit != "" {
++		t, err := time.Parse("2006-01-02", req.RegistriertSeit)
++		if err != nil {
++			jsonError(w, "invalid registriert_seit format (expected YYYY-MM-DD)", http.StatusBadRequest)
++			return
++		}
++		existing.RegistriertSeit = &t
++		registriertSeitChanged = true
++	}
++
+ 	if err := h.meterPointRepo.Update(r.Context(), existing); err != nil {
+ 		jsonError(w, "failed to update meter point", http.StatusInternalServerError)
+ 		return
+@@ -230,6 +242,15 @@
+ 			jsonError(w, "failed to update registration history", http.StatusInternalServerError)
+ 			return
+ 		}
++	}
++
++	// Bei manueller Datumsaenderung auch den Beginn der offenen Registrierungsperiode
++	// mitziehen, damit die Registrierungshistorie zum korrigierten Datum passt.
++	if registriertSeitChanged && existing.RegistriertSeit != nil {
++		if err := h.meterPointRepo.SetPeriodStartManual(r.Context(), existing.EegID, existing.Zaehlpunkt, *existing.RegistriertSeit); err != nil {
++			jsonError(w, "failed to update registration history", http.StatusInternalServerError)
++			return
++		}
+ 	}
+ 
+ 	jsonOK(w, existing)
+diff --git a/api/internal/repository/meterpoint.go b/api/internal/repository/meterpoint.go
+--- a/api/internal/repository/meterpoint.go	2026-07-06 14:26:47.171000222 +0200
++++ b/api/internal/repository/meterpoint.go	2026-07-06 14:26:47.188000222 +0200
+@@ -409,6 +409,12 @@
+ 	return r.periods.ReopenLatestPeriod(ctx, eegID, zaehlpunkt)
+ }
+ 
++// SetPeriodStartManual korrigiert den Beginn (registriert_seit) der aktuell offenen
++// Registrierungsperiode nach einer manuellen Admin-Datumsaenderung.
++func (r *MeterPointRepository) SetPeriodStartManual(ctx context.Context, eegID uuid.UUID, zaehlpunkt string, date time.Time) error {
++	return r.periods.SetOpenPeriodStart(ctx, eegID, zaehlpunkt, date)
++}
++
+ // ListRegistrationHistory returns the full Anmeldung/Abmeldung history for a Zählpunkt.
+ func (r *MeterPointRepository) ListRegistrationHistory(ctx context.Context, eegID uuid.UUID, zaehlpunkt string) ([]domain.MeterPointRegistrationPeriod, error) {
+ 	return r.periods.ListByZaehlpunkt(ctx, eegID, zaehlpunkt)
+@@ -524,10 +530,10 @@
+ 
+ func (r *MeterPointRepository) Update(ctx context.Context, mp *domain.MeterPoint) error {
+ 	q := `UPDATE meter_points SET
+-	        energierichtung=$1, verteilungsmodell=$2, zugeteilte_menge_pct=$3, status=$4, generation_type=$5, notes=$6, abgemeldet_am=$7
+-	      WHERE id=$8`
++	        energierichtung=$1, verteilungsmodell=$2, zugeteilte_menge_pct=$3, status=$4, generation_type=$5, notes=$6, abgemeldet_am=$7, registriert_seit=$8
++	      WHERE id=$9`
+ 	_, err := r.db.Exec(ctx, q,
+-		mp.Energierichtung, mp.Verteilungsmodell, mp.ZugeteilteMenugePct, mp.Status, mp.GenerationType, mp.Notes, mp.AbgemeldetAm, mp.ID,
++		mp.Energierichtung, mp.Verteilungsmodell, mp.ZugeteilteMenugePct, mp.Status, mp.GenerationType, mp.Notes, mp.AbgemeldetAm, mp.RegistriertSeit, mp.ID,
+ 	)
+ 	if err != nil {
+ 		return fmt.Errorf("update: %w", err)
+diff --git a/api/internal/repository/meter_point_registration_period.go b/api/internal/repository/meter_point_registration_period.go
+--- a/api/internal/repository/meter_point_registration_period.go	2026-07-06 14:26:47.181000222 +0200
++++ b/api/internal/repository/meter_point_registration_period.go	2026-07-06 14:26:47.188000222 +0200
+@@ -75,6 +75,21 @@
+ 	return nil
+ }
+ 
++// SetOpenPeriodStart aktualisiert registriert_seit (Perioden-Beginn) der aktuell offenen
++// Periode eines Zählpunkts. No-op, wenn keine offen ist. Fuer manuelle Datumskorrekturen.
++func (r *MeterPointRegistrationPeriodRepository) SetOpenPeriodStart(ctx context.Context, eegID uuid.UUID, zaehlpunkt string, date time.Time) error {
++	_, err := r.db.Exec(ctx,
++		`UPDATE meter_point_registration_periods
++		 SET registriert_seit = $3
++		 WHERE eeg_id = $1 AND zaehlpunkt = $2 AND abgemeldet_am IS NULL`,
++		eegID, zaehlpunkt, date.UTC().Truncate(24*time.Hour),
++	)
++	if err != nil {
++		return fmt.Errorf("update open registration period start: %w", err)
++	}
++	return nil
++}
++
+ // ListByZaehlpunkt returns all registration periods for a Zählpunkt, oldest first.
+ func (r *MeterPointRegistrationPeriodRepository) ListByZaehlpunkt(ctx context.Context, eegID uuid.UUID, zaehlpunkt string) ([]domain.MeterPointRegistrationPeriod, error) {
+ 	rows, err := r.db.Query(ctx,

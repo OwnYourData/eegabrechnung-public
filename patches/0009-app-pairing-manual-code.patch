@@ -1,0 +1,158 @@
+diff --git a/api/internal/db/migrations/090_app_login_token_code.down.sql b/api/internal/db/migrations/090_app_login_token_code.down.sql
+new file mode 100644
+index 0000000..437ccd2
+--- /dev/null
++++ b/api/internal/db/migrations/090_app_login_token_code.down.sql
+@@ -0,0 +1,2 @@
++DROP INDEX IF EXISTS idx_app_login_tokens_code_hash;
++ALTER TABLE app_login_tokens DROP COLUMN IF EXISTS code_hash;
+diff --git a/api/internal/db/migrations/090_app_login_token_code.up.sql b/api/internal/db/migrations/090_app_login_token_code.up.sql
+new file mode 100644
+index 0000000..0a109d5
+--- /dev/null
++++ b/api/internal/db/migrations/090_app_login_token_code.up.sql
+@@ -0,0 +1,8 @@
++-- Manueller Eingabe-Code (8 Zeichen Crockford-Base32) als Alternative zum QR.
++-- Zeigt auf DENSELBEN Pairing-Vorgang: gleiche TTL, gleiche Einmal-Nutzung.
++-- Gespeichert wird ausschließlich der SHA-256-Hex des normalisierten Codes —
++-- niemals der Klartext (der lebt nur auf dem Portal-Bildschirm).
++ALTER TABLE app_login_tokens ADD COLUMN IF NOT EXISTS code_hash text;
++
++CREATE UNIQUE INDEX IF NOT EXISTS idx_app_login_tokens_code_hash
++    ON app_login_tokens (code_hash) WHERE code_hash IS NOT NULL;
+diff --git a/api/internal/handler/portal_app_token.go b/api/internal/handler/portal_app_token.go
+index f3f011b..49fa345 100644
+--- a/api/internal/handler/portal_app_token.go
++++ b/api/internal/handler/portal_app_token.go
+@@ -69,9 +69,26 @@ func (h *MemberPortalHandler) GetAppToken(w http.ResponseWriter, r *http.Request
+ 	sum := sha256.Sum256([]byte(loginToken))
+ 	tokenHash := hex.EncodeToString(sum[:])
+ 
+-	if err := h.portalRepo.CreateAppLoginToken(r.Context(), tokenHash, memberID, int(ttl.Seconds())); err != nil {
+-		jsonError(w, "failed to store login token", http.StatusInternalServerError)
+-		return
++	// Manueller Eingabe-Code (8 Zeichen Crockford-Base32, 32^8 ~ 2^40) — Notfallweg,
++	// wenn die Kamera nicht geht. Zeigt auf DENSELBEN Vorgang wie das QR-JWT.
++	// Auch hier: nur der SHA-256-Hex landet in der DB, nie der Klartext.
++	var pairingCode string
++	for attempt := 0; ; attempt++ {
++		pairingCode, err = newPairingCode()
++		if err != nil {
++			jsonError(w, "failed to generate pairing code", http.StatusInternalServerError)
++			return
++		}
++		codeSum := sha256.Sum256([]byte(pairingCode))
++		err = h.portalRepo.CreateAppLoginToken(r.Context(), tokenHash,
++			hex.EncodeToString(codeSum[:]), memberID, int(ttl.Seconds()))
++		if err == nil {
++			break
++		}
++		if attempt >= 4 { // praktisch unmöglich (2^40) — aber nie endlos drehen
++			jsonError(w, "failed to store login token", http.StatusInternalServerError)
++			return
++		}
+ 	}
+ 
+ 	jwtStr, err := signAppJWT(priv, kid, loginToken, ttl)
+@@ -90,7 +107,8 @@ func (h *MemberPortalHandler) GetAppToken(w http.ResponseWriter, r *http.Request
+ 	// body — it exists only inside the rendered QR image.
+ 	w.Header().Set("Content-Type", "application/json")
+ 	_ = json.NewEncoder(w).Encode(map[string]string{
+-		"qr":          "data:image/png;base64," + base64.StdEncoding.EncodeToString(png),
++		"qr":           "data:image/png;base64," + base64.StdEncoding.EncodeToString(png),
++		"pairing_code": pairingCode,
+ 		"ios_url":     strings.TrimSpace(os.Getenv(envAppIOSURL)),
+ 		"android_url": strings.TrimSpace(os.Getenv(envAppAndroidURL)),
+ 		"expires_in":  strconv.Itoa(int(ttl.Seconds())),
+@@ -220,3 +238,20 @@ func base58Decode(s string) ([]byte, error) {
+ 	copy(out[leading:], decoded)
+ 	return out, nil
+ }
++
++// crockfordAlphabet ohne I, L, O, U — verwechslungsarm beim Abtippen/Vorlesen.
++const crockfordAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
++
++// newPairingCode returns an 8-character Crockford-Base32 code (32^8 ~ 2^40).
++// 256 % 32 == 0, therefore the modulo mapping is bias-free.
++func newPairingCode() (string, error) {
++	b := make([]byte, 8)
++	if _, err := rand.Read(b); err != nil {
++		return "", err
++	}
++	out := make([]byte, 8)
++	for i, v := range b {
++		out[i] = crockfordAlphabet[int(v)%32]
++	}
++	return string(out), nil
++}
+diff --git a/api/internal/repository/member_portal.go b/api/internal/repository/member_portal.go
+index ad224d7..cb1ed31 100644
+--- a/api/internal/repository/member_portal.go
++++ b/api/internal/repository/member_portal.go
+@@ -212,11 +212,11 @@ func (r *MemberPortalRepository) ConfirmEmailChange(ctx context.Context, v *Emai
+ // inside the QR code shown to the member. Billing does not mark tokens as consumed;
+ // single-use is enforced by the GrünLicht API in its own database, so the API can stay
+ // strictly read-only on this database.
+-func (r *MemberPortalRepository) CreateAppLoginToken(ctx context.Context, tokenHash string, memberID uuid.UUID, ttlSeconds int) error {
++func (r *MemberPortalRepository) CreateAppLoginToken(ctx context.Context, tokenHash, codeHash string, memberID uuid.UUID, ttlSeconds int) error {
+ 	_, err := r.db.Exec(ctx,
+-		`INSERT INTO app_login_tokens (token_hash, member_id, expires_at)
+-		 VALUES ($1, $2, now() + make_interval(secs => $3))`,
+-		tokenHash, memberID, ttlSeconds)
++		`INSERT INTO app_login_tokens (token_hash, code_hash, member_id, expires_at)
++		 VALUES ($1, $2, $3, now() + make_interval(secs => $4))`,
++		tokenHash, codeHash, memberID, ttlSeconds)
+ 	return err
+ }
+ 
+diff --git a/web/app/portal/dashboard/PortalDashboardClient.tsx b/web/app/portal/dashboard/PortalDashboardClient.tsx
+index fe6b236..59934e3 100644
+--- a/web/app/portal/dashboard/PortalDashboardClient.tsx
++++ b/web/app/portal/dashboard/PortalDashboardClient.tsx
+@@ -117,7 +117,7 @@ interface Props {
+ 
+ export default function PortalDashboardClient({ member, eeg, invoices, documents, meterPoints, showFullEnergy }: Props) {
+   const [activeTab, setActiveTab] = useState<"energy" | "invoices" | "downloads" | "zaehlpunkte" | "profil" | "app">("energy");
+-  const [appQr, setAppQr] = useState<{ qr: string; ios_url: string; android_url: string; expires_in: number } | null>(null);
++  const [appQr, setAppQr] = useState<{ qr: string; pairing_code?: string; ios_url: string; android_url: string; expires_in: number } | null>(null);
+   const [appLoading, setAppLoading] = useState(false);
+   const [appError, setAppError] = useState<string | null>(null);
+   const [appRemaining, setAppRemaining] = useState(0);
+@@ -128,7 +128,7 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+       .then((r) => (r.ok ? r.json() : Promise.reject(new Error("failed"))))
+       .then((d) => {
+         const ttl = Number(d.expires_in) || 180;
+-        setAppQr({ qr: d.qr, ios_url: d.ios_url, android_url: d.android_url, expires_in: ttl });
++        setAppQr({ qr: d.qr, pairing_code: d.pairing_code, ios_url: d.ios_url, android_url: d.android_url, expires_in: ttl });
+         setAppRemaining(ttl);
+       })
+       .catch(() => setAppError("QR-Code konnte nicht geladen werden."))
+@@ -777,6 +777,11 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+                   <strong>nicht</strong> überein — oder hast du gerade gar nichts gescannt — dann bitte{" "}
+                   <strong>ablehnen</strong>.
+                 </p>
++                <p className="text-xs text-red-900 font-medium bg-red-100 rounded px-3 py-2">
++                  Nur bestätigen, wenn Sie gerade <strong>selbst</strong> die App verbinden. Geben Sie
++                  Ihren Verbindungs-Code <strong>niemals telefonisch weiter</strong> — niemand von der
++                  Energiegemeinschaft wird Sie danach fragen.
++                </p>
+                 <div className="flex gap-3">
+                   <button
+                     onClick={() => respondPairing(pairing.id, "confirm")}
+@@ -840,6 +845,16 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+                     </div>
+                   )}
+                 </div>
++                {appQr.pairing_code && appRemaining > 0 && (
++                  <div className="text-center">
++                    <p className="text-xs text-slate-500 mb-1">
++                      Kamera geht nicht? Diesen Code in der App eintippen:
++                    </p>
++                    <p className="font-mono text-2xl font-bold tracking-widest text-slate-900">
++                      {appQr.pairing_code.slice(0, 4)}-{appQr.pairing_code.slice(4)}
++                    </p>
++                  </div>
++                )}
+                 {appRemaining > 0 ? (
+                   <p className="text-xs text-slate-500 text-center">
+                     Aus Sicherheitsgründen ist der Code nur noch{" "}

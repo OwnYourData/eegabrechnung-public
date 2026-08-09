@@ -1,0 +1,209 @@
+diff --git a/api/internal/domain/types.go b/api/internal/domain/types.go
+--- a/api/internal/domain/types.go
++++ b/api/internal/domain/types.go
+@@ -152,6 +152,8 @@
+ 	// Gap alert: notify when meter points have no readings for N days
+ 	GapAlertEnabled       bool `json:"gap_alert_enabled"`
+ 	GapAlertThresholdDays int  `json:"gap_alert_threshold_days"` // default 5
++	// OnboardingReminderEnabled gates the 72h "Beitritt abschließen" reminder emails. Default true.
++	OnboardingReminderEnabled bool `json:"onboarding_reminder_enabled"`
+ 	// EnergyImbalanceThresholdPromille is the tolerance (‰ of the larger total) for the
+ 	// community-wide generation-vs-consumption balance warning on billing runs. Default 1 (=0.1%).
+ 	EnergyImbalanceThresholdPromille float64 `json:"energy_imbalance_threshold_promille"`
+diff --git a/api/internal/repository/eeg.go b/api/internal/repository/eeg.go
+--- a/api/internal/repository/eeg.go
++++ b/api/internal/repository/eeg.go
+@@ -63,6 +63,7 @@
+ 	eda_imap_host, eda_imap_user, eda_imap_password_enc,
+ 	eda_smtp_host, eda_smtp_user, eda_smtp_password_enc, eda_smtp_from,
+ 	smtp_host, smtp_user, smtp_password_enc, smtp_from,
++	onboarding_reminder_enabled,
+ 	created_at`
+ 
+ func (r *EEGRepository) scanEEG(row interface{ Scan(...any) error }, e *domain.EEG) error {
+@@ -98,6 +99,7 @@
+ 		&edaImapHost, &edaImapUser, &edaImapPwEnc,
+ 		&edaSmtpHost, &edaSmtpUser, &edaSmtpPwEnc, &edaSmtpFrom,
+ 		&smtpHost, &smtpUser, &smtpPwEnc, &smtpFrom,
++		&e.OnboardingReminderEnabled,
+ 		&e.CreatedAt,
+ 	)
+ 	if err != nil {
+@@ -238,7 +240,8 @@
+ 	        invoice_payment_notice_mode=$61,
+ 	        eda_dis_model=$62,
+ 	        fee_billing_mode=$63,
+-	        energy_imbalance_threshold_promille=$64
++	        energy_imbalance_threshold_promille=$64,
++	        onboarding_reminder_enabled=$65
+ 	      WHERE id=$50 AND organization_id=$51`
+ 	// Note: logo_path and auto_billing_last_run_at are not updated via this method.
+ 	days := eeg.SepaPreNotificationDays
+@@ -274,6 +277,7 @@
+ 		eeg.EdaDisModel,
+ 		eeg.FeeBillingMode,
+ 		eeg.EnergyImbalanceThresholdPromille,
++		eeg.OnboardingReminderEnabled,
+ 	)
+ 	return err
+ }
+diff --git a/api/internal/handler/eeg.go b/api/internal/handler/eeg.go
+--- a/api/internal/handler/eeg.go
++++ b/api/internal/handler/eeg.go
+@@ -145,6 +145,8 @@
+ 	// Gap alert
+ 	GapAlertEnabled       bool `json:"gap_alert_enabled"`
+ 	GapAlertThresholdDays int  `json:"gap_alert_threshold_days"`
++	// Onboarding reminders (72h "Beitritt abschließen" follow-up)
++	OnboardingReminderEnabled bool `json:"onboarding_reminder_enabled"`
+ 	// Energy imbalance warning tolerance (‰)
+ 	EnergyImbalanceThresholdPromille float64 `json:"energy_imbalance_threshold_promille"`
+ 	// Member portal
+@@ -571,6 +573,9 @@
+ 		existing.GapAlertThresholdDays = req.GapAlertThresholdDays
+ 	}
+ 
++	// Onboarding reminder toggle
++	existing.OnboardingReminderEnabled = req.OnboardingReminderEnabled
++
+ 	// Energy imbalance warning tolerance
+ 	if req.EnergyImbalanceThresholdPromille <= 0 {
+ 		existing.EnergyImbalanceThresholdPromille = 1
+diff --git a/api/internal/repository/onboarding.go b/api/internal/repository/onboarding.go
+--- a/api/internal/repository/onboarding.go
++++ b/api/internal/repository/onboarding.go
+@@ -333,7 +333,8 @@
+ 	      WHERE o.status = 'eda_sent'
+ 	        AND o.updated_at < now() - $1::interval
+ 	        AND o.reminder_sent_at IS NULL
+-	        AND e.is_demo = false`
++	        AND e.is_demo = false
++	        AND e.onboarding_reminder_enabled = true`
+ 
+ 	rows, err := r.db.Query(ctx, q, fmt.Sprintf("%.0f seconds", delay.Seconds()))
+ 	if err != nil {
+@@ -382,6 +383,7 @@
+ 		WHERE ev.created_at < now() - $1::interval
+ 		  AND ev.reminder_sent_at IS NULL
+ 		  AND e.is_demo = false
++		  AND e.onboarding_reminder_enabled = true
+ 		  AND NOT EXISTS (
+ 		    SELECT 1 FROM onboarding_requests o
+ 		    WHERE o.eeg_id = ev.eeg_id
+diff --git a/api/internal/repository/meterpoint.go b/api/internal/repository/meterpoint.go
+--- a/api/internal/repository/meterpoint.go
++++ b/api/internal/repository/meterpoint.go
+@@ -663,3 +663,16 @@
+ 	}
+ 	return result, rows.Err()
+ }
++
++// MarkOnboardingActiveByMeterPoint flips the onboarding_request of the meter point's member
++// from 'eda_sent'/'converted' to 'active'. Called when registriert_seit is set manually
++// (external/manual EDA confirmation) so the 72h "Beitritt abschließen" reminders stop going
++// to already-full members. Best-effort; no-op when no matching request exists.
++func (r *MeterPointRepository) MarkOnboardingActiveByMeterPoint(ctx context.Context, meterPointID uuid.UUID) error {
++	_, err := r.db.Exec(ctx, `
++		UPDATE onboarding_requests
++		SET status = 'active', updated_at = now()
++		WHERE converted_member_id = (SELECT member_id FROM meter_points WHERE id = $1)
++		  AND status IN ('eda_sent', 'converted')`, meterPointID)
++	return err
++}
+diff --git a/api/internal/handler/meter_point.go b/api/internal/handler/meter_point.go
+--- a/api/internal/handler/meter_point.go
++++ b/api/internal/handler/meter_point.go
+@@ -257,6 +257,10 @@
+ 			jsonError(w, "failed to update registration history", http.StatusInternalServerError)
+ 			return
+ 		}
++		// Manuelle/externe Aktivierung ⇒ Onboarding-Anfrage auf 'active' schalten, damit die
++		// 72h-"Beitritt abschließen"-Erinnerungen nicht mehr an bereits vollwertige Mitglieder
++		// gehen. Best-effort: ein Fehler hier darf das Speichern nicht scheitern lassen.
++		_ = h.meterPointRepo.MarkOnboardingActiveByMeterPoint(r.Context(), existing.ID)
+ 	}
+ 
+ 	jsonOK(w, existing)
+diff --git a/web/lib/api.ts b/web/lib/api.ts
+--- a/web/lib/api.ts
++++ b/web/lib/api.ts
+@@ -178,6 +178,7 @@
+   auto_billing_period?: string;
+   // Gap alert
+   gap_alert_enabled?: boolean;
++  onboarding_reminder_enabled?: boolean;
+   gap_alert_threshold_days?: number;
+   // Energy imbalance warning
+   energy_imbalance_threshold_promille?: number;
+diff --git a/web/app/eegs/[eegId]/settings/page.tsx b/web/app/eegs/[eegId]/settings/page.tsx
+--- a/web/app/eegs/[eegId]/settings/page.tsx
++++ b/web/app/eegs/[eegId]/settings/page.tsx
+@@ -128,6 +128,8 @@
+       // Gap alert
+       gap_alert_enabled: formData.get("gap_alert_enabled") === "on",
+       gap_alert_threshold_days: parseInt(formData.get("gap_alert_threshold_days") as string) || 5,
++      // Onboarding reminders
++      onboarding_reminder_enabled: formData.get("onboarding_reminder_enabled") === "on",
+       // Energy imbalance warning
+       energy_imbalance_threshold_promille: parseFloat(formData.get("energy_imbalance_threshold_promille") as string) || 1,
+       // Member portal
+@@ -272,7 +274,10 @@
+           </>
+         )}
+         {activeTab !== "onboarding" && (
+-          <input type="hidden" name="onboarding_contract_text" value={eeg.onboarding_contract_text || ""} />
++          <>
++            <input type="hidden" name="onboarding_contract_text" value={eeg.onboarding_contract_text || ""} />
++            <input type="hidden" name="onboarding_reminder_enabled" value={(eeg as any).onboarding_reminder_enabled !== false ? "on" : ""} />
++          </>
+         )}
+         {activeTab !== "abrechnung" && (
+           <>
+@@ -833,6 +838,7 @@
+ 
+         {/* ── TAB: ONBOARDING ────────────────────────────────────── */}
+         {activeTab === "onboarding" && (
++          <>
+           <div className="bg-white rounded-xl border border-slate-200 p-6">
+             <h2 className="text-base font-semibold text-slate-900 mb-1">Vertragstext (Beitrittserklärung)</h2>
+             <p className="text-xs text-slate-500 mb-4">
+@@ -849,6 +855,26 @@
+               className={`${inputClass} font-mono text-xs`}
+             />
+           </div>
++          <div className="bg-white rounded-xl border border-slate-200 p-6 mt-6">
++            <h2 className="text-base font-semibold text-slate-900 mb-1">Beitritts-Erinnerungen</h2>
++            <p className="text-xs text-slate-500 mb-4">
++              Erinnert Antragsteller nach 72 Stunden per E-Mail, ihren Beitritt abzuschließen. Deaktivieren, wenn
++              Mitglieder extern (z. B. direkt im EDA-Portal) bestätigt werden und keine Erinnerungen erhalten sollen.
++            </p>
++            <div className="flex items-center gap-3 p-4 bg-slate-50 rounded-lg border border-slate-200">
++              <input
++                type="checkbox"
++                name="onboarding_reminder_enabled"
++                id="onboarding_reminder_enabled"
++                defaultChecked={(eeg as any).onboarding_reminder_enabled !== false}
++                className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
++              />
++              <label htmlFor="onboarding_reminder_enabled" className="text-sm font-medium text-slate-700 cursor-pointer">
++                72h-Beitritts-Erinnerungen senden
++              </label>
++            </div>
++          </div>
++          </>
+         )}
+ 
+         {/* ── TAB: AUTO-ABRECHNUNG ──────────────────────────────── */}
+diff --git a/api/internal/db/migrations/087_onboarding_reminder_toggle.up.sql b/api/internal/db/migrations/087_onboarding_reminder_toggle.up.sql
+new file mode 100644
+--- /dev/null
++++ b/api/internal/db/migrations/087_onboarding_reminder_toggle.up.sql
+@@ -0,0 +1,2 @@
++ALTER TABLE eegs
++  ADD COLUMN IF NOT EXISTS onboarding_reminder_enabled BOOLEAN NOT NULL DEFAULT true;
+diff --git a/api/internal/db/migrations/087_onboarding_reminder_toggle.down.sql b/api/internal/db/migrations/087_onboarding_reminder_toggle.down.sql
+new file mode 100644
+--- /dev/null
++++ b/api/internal/db/migrations/087_onboarding_reminder_toggle.down.sql
+@@ -0,0 +1 @@
++ALTER TABLE eegs DROP COLUMN IF EXISTS onboarding_reminder_enabled;

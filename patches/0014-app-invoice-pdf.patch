@@ -1,0 +1,151 @@
+diff --git a/api/cmd/server/main.go b/api/cmd/server/main.go
+index ee0af87..4e913d6 100644
+--- a/api/cmd/server/main.go
++++ b/api/cmd/server/main.go
+@@ -103,6 +103,7 @@ func main() {
+ 	eegHandler := handler.NewEEGHandler(eegRepo, memberRepo, meterPointRepo, participationRepo)
+ 	importHandler := handler.NewImportHandler(eegRepo, memberRepo, meterPointRepo, readingRepo)
+ 	billingHandler := handler.NewBillingHandler(billingSvc, invoiceRepo, billingRunRepo, memberRepo, eegRepo, emailLogRepo, webBaseURL)
++	appInvoiceHandler := handler.NewAppInvoiceHandler(invoiceRepo)
+ 	memberHandler := handler.NewMemberHandler(memberRepo, meterPointRepo, eegRepo, edaProcessRepo, jobRepo, participationRepo)
+ 	meterPointHandler := handler.NewMeterPointHandler(meterPointRepo, memberRepo, eegRepo, edaProcessRepo)
+ 	statsHandler := handler.NewStatsHandler(eegRepo, edaMessageRepo)
+@@ -183,6 +184,7 @@ func main() {
+ 
+ 	// Public onboarding (no auth required)
+ 	r.Get("/api/v1/public/eegs/{eegID}/info", onboardingHandler.GetPublicEEGInfo)
++	r.Get("/app/invoices/{id}/pdf", appInvoiceHandler.GetPDF)
+ 	r.With(onboardingLimiter.Middleware).Post("/api/v1/public/eegs/{eegID}/onboarding", onboardingHandler.SubmitOnboarding)
+ 	r.Get("/api/v1/public/onboarding/status/{token}", onboardingHandler.GetOnboardingStatus)
+ 	r.With(onboardingLimiter.Middleware).Post("/api/v1/public/onboarding/resend-token", onboardingHandler.ResendToken)
+diff --git a/api/internal/handler/app_invoice_pdf.go b/api/internal/handler/app_invoice_pdf.go
+new file mode 100644
+index 0000000..f164069
+--- /dev/null
++++ b/api/internal/handler/app_invoice_pdf.go
+@@ -0,0 +1,88 @@
++package handler
++
++import (
++	"crypto/hmac"
++	"crypto/sha256"
++	"encoding/hex"
++	"io"
++	"net/http"
++	"os"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/go-chi/chi/v5"
++	"github.com/google/uuid"
++	"github.com/lutzerb/eegabrechnung/internal/repository"
++)
++
++// INVOICE_URL_SIGNING_KEY is shared with the GrünLicht API — it mints the signed URL,
++// we verify the same HMAC. Set from the environment/secret, never in code.
++const envInvoiceURLSigningKey = "INVOICE_URL_SIGNING_KEY"
++
++// AppInvoiceHandler serves invoice PDFs via short-lived, HMAC-signed capability URLs.
++type AppInvoiceHandler struct {
++	invoiceRepo *repository.InvoiceRepository
++}
++
++func NewAppInvoiceHandler(invoiceRepo *repository.InvoiceRepository) *AppInvoiceHandler {
++	return &AppInvoiceHandler{invoiceRepo: invoiceRepo}
++}
++
++// GetPDF streams an invoice PDF if the signature and expiry are valid.
++// Router (public, no session): GET /app/invoices/{id}/pdf?exp=<unix>&sig=<hex>
++//
++// The GrünLicht API mints this URL ONLY for an invoice the logged-in member owns
++// (ownership checked there against the member_ref-filtered view). The signed URL is a
++// short-lived capability — we therefore only verify signature + expiry, never member
++// ownership again, and NEVER leak whether an id exists: every failure returns 404.
++func (h *AppInvoiceHandler) GetPDF(w http.ResponseWriter, r *http.Request) {
++	id := chi.URLParam(r, "id") // chi returns the URL-decoded path value
++	exp := r.URL.Query().Get("exp")
++	sig := r.URL.Query().Get("sig")
++
++	key := strings.TrimSpace(os.Getenv(envInvoiceURLSigningKey))
++	if key == "" || id == "" || exp == "" || sig == "" {
++		http.NotFound(w, r)
++		return
++	}
++
++	// 1. Signature — constant-time. message = "<id>|<exp>", HMAC-SHA256 hex lowercase.
++	mac := hmac.New(sha256.New, []byte(key))
++	mac.Write([]byte(id + "|" + exp))
++	expected := hex.EncodeToString(mac.Sum(nil))
++	if !hmac.Equal([]byte(strings.ToLower(sig)), []byte(expected)) {
++		http.NotFound(w, r)
++		return
++	}
++
++	// 2. Expiry — exp (Unix seconds) must be >= now.
++	expUnix, err := strconv.ParseInt(exp, 10, 64)
++	if err != nil || time.Now().Unix() > expUnix {
++		http.NotFound(w, r)
++		return
++	}
++
++	// 3. Load invoice, stream PDF. Any error -> 404.
++	invID, err := uuid.Parse(id)
++	if err != nil {
++		http.NotFound(w, r)
++		return
++	}
++	inv, err := h.invoiceRepo.GetByID(r.Context(), invID)
++	if err != nil || inv == nil || inv.PdfPath == "" {
++		http.NotFound(w, r)
++		return
++	}
++	f, err := os.Open(inv.PdfPath)
++	if err != nil {
++		http.NotFound(w, r)
++		return
++	}
++	defer f.Close()
++
++	w.Header().Set("Content-Type", "application/pdf")
++	w.Header().Set("Content-Disposition", "inline")
++	w.Header().Set("X-Robots-Tag", "noindex, nofollow")
++	_, _ = io.Copy(w, f)
++}
+diff --git a/web/app/app/invoices/[id]/pdf/route.ts b/web/app/app/invoices/[id]/pdf/route.ts
+new file mode 100644
+index 0000000..057679b
+--- /dev/null
++++ b/web/app/app/invoices/[id]/pdf/route.ts
+@@ -0,0 +1,31 @@
++import { NextRequest } from "next/server";
++
++const API = process.env.API_INTERNAL_URL || "http://localhost:8080";
++
++// Öffentliche, HMAC-signierte PDF-Auslieferung (kein Login).
++// abrechnung.eeg-gruenlicht.at zeigt auf Next -> wir reichen an die Go-API weiter,
++// die Signatur/Ablauf prüft und die PDF-Datei vom Volume streamt. Jeder Fehler -> 404.
++export async function GET(
++  request: NextRequest,
++  context: { params: Promise<{ id: string }> }
++) {
++  const { id } = await context.params;
++  const exp = request.nextUrl.searchParams.get("exp") ?? "";
++  const sig = request.nextUrl.searchParams.get("sig") ?? "";
++
++  const upstream =
++    `${API}/app/invoices/${encodeURIComponent(id)}/pdf` +
++    `?exp=${encodeURIComponent(exp)}&sig=${encodeURIComponent(sig)}`;
++
++  const res = await fetch(upstream, { cache: "no-store" });
++  if (!res.ok || !res.body) return new Response("Not found", { status: 404 });
++
++  return new Response(res.body, {
++    status: 200,
++    headers: {
++      "Content-Type": "application/pdf",
++      "Content-Disposition": "inline",
++      "X-Robots-Tag": "noindex, nofollow",
++    },
++  });
++}

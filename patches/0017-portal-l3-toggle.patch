@@ -1,0 +1,91 @@
+diff --git a/api/internal/handler/member_portal.go b/api/internal/handler/member_portal.go
+index 8a3cfe0..dc477d3 100644
+--- a/api/internal/handler/member_portal.go
++++ b/api/internal/handler/member_portal.go
+@@ -348,7 +348,8 @@ func (h *MemberPortalHandler) GetEnergy(w http.ResponseWriter, r *http.Request)
+ 		return
+ 	}
+ 
+-	rows, err := h.readingRepo.GetMemberEnergy(r.Context(), memberID, from, to, granularity)
++	includeL3 := r.URL.Query().Get("include_l3") == "true"
++	rows, err := h.readingRepo.GetMemberEnergy(r.Context(), memberID, from, to, granularity, includeL3)
+ 	if err != nil {
+ 		jsonError(w, "query error", http.StatusInternalServerError)
+ 		return
+diff --git a/api/internal/repository/reading.go b/api/internal/repository/reading.go
+index b4c44cf..83c336a 100644
+--- a/api/internal/repository/reading.go
++++ b/api/internal/repository/reading.go
+@@ -3,6 +3,7 @@ package repository
+ import (
+ 	"context"
+ 	"fmt"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/google/uuid"
+@@ -337,7 +338,7 @@ type PortalEnergyRow struct {
+ // GetMemberEnergy returns aggregated energy for a member with configurable granularity and date range.
+ // granularity must be one of: "year", "month", "day", "15min".
+ // The period label is pre-formatted in Europe/Vienna time to avoid client-side timezone gymnastics.
+-func (r *ReadingRepository) GetMemberEnergy(ctx context.Context, memberID uuid.UUID, from, to time.Time, granularity string) ([]PortalEnergyRow, error) {
++func (r *ReadingRepository) GetMemberEnergy(ctx context.Context, memberID uuid.UUID, from, to time.Time, granularity string, includeL3 bool) ([]PortalEnergyRow, error) {
+ 	var periodExpr, periodFmt string
+ 	switch granularity {
+ 	case "15min":
+@@ -369,6 +370,9 @@ func (r *ReadingRepository) GetMemberEnergy(ctx context.Context, memberID uuid.U
+ 		  AND er.quality != 'L3'
+ 		GROUP BY %s
+ 		ORDER BY %s ASC`, periodExpr, periodFmt, periodExpr, periodExpr)
++	if includeL3 {
++		q = strings.Replace(q, "er.quality != 'L3'", "TRUE", 1)
++	}
+ 
+ 	rows, err := r.db.Query(ctx, q, memberID, from, to)
+ 	if err != nil {
+diff --git a/web/app/portal/dashboard/PortalDashboardClient.tsx b/web/app/portal/dashboard/PortalDashboardClient.tsx
+index e81e536..66c82ed 100644
+--- a/web/app/portal/dashboard/PortalDashboardClient.tsx
++++ b/web/app/portal/dashboard/PortalDashboardClient.tsx
+@@ -286,6 +286,7 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+   const [energyRows, setEnergyRows] = useState<PortalEnergyRow[]>([]);
+   const [energyLoading, setEnergyLoading] = useState(true);
+   const [energyError, setEnergyError] = useState<string | null>(null);
++  const [includeL3, setIncludeL3] = useState(false);
+ 
+   useEffect(() => {
+     let cancelled = false;
+@@ -316,7 +317,7 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+       granularity = "15min";
+     }
+ 
+-    fetch(`/api/portal/energy?from=${from}&to=${to}&granularity=${granularity}`)
++    fetch(`/api/portal/energy?from=${from}&to=${to}&granularity=${granularity}${includeL3 ? "&include_l3=true" : ""}`)
+       .then(r => r.json())
+       .then(data => {
+         if (!cancelled) {
+@@ -332,7 +333,7 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+       });
+ 
+     return () => { cancelled = true; };
+-  }, [periodMode, navYear, navMonth, navDay]);
++  }, [periodMode, navYear, navMonth, navDay, includeL3]);
+ 
+   function navPrev() {
+     if (periodMode === "month") {
+@@ -613,6 +614,15 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+                 </div>
+               )}
+             </div>
++            <label className="flex items-center gap-2 text-xs text-slate-500 cursor-pointer select-none">
++              <input
++                type="checkbox"
++                checked={includeL3}
++                onChange={(e) => setIncludeL3(e.target.checked)}
++                className="h-4 w-4 rounded border-slate-300 text-slate-600 focus:ring-slate-400"
++              />
++              Fehlerhafte Messwerte (Qualität L3) einbeziehen
++            </label>
+ 
+             {energyLoading ? (
+               <div className="bg-white rounded-xl border border-slate-200 px-6 py-16 text-center">

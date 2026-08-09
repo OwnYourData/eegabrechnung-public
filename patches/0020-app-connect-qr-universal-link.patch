@@ -1,0 +1,44 @@
+diff --git a/api/internal/handler/portal_app_token.go b/api/internal/handler/portal_app_token.go
+index 91bcc88..2d49ce1 100644
+--- a/api/internal/handler/portal_app_token.go
++++ b/api/internal/handler/portal_app_token.go
+@@ -97,7 +97,16 @@ func (h *MemberPortalHandler) GetAppToken(w http.ResponseWriter, r *http.Request
+ 		return
+ 	}
+ 
+-	png, err := qrcode.Encode(jwtStr, qrcode.Medium, 320)
++	// Der QR trägt den VOLLSTÄNDIGEN Universal Link, nicht das nackte JWT: nur dann
++	// erkennt die iPhone-Kamera ihn als URL und bietet an, die App zu öffnen (der
++	// Kamera-Scan ist "fremder Kontext" — anders als ein Tap im Portal auf derselben
++	// Domain, den iOS nicht in die App leitet). Der In-App-Scanner zieht das JWT
++	// ohnehin per Regex aus beliebigem Text, funktioniert also mit beiden Inhalten.
++	appLink := strings.TrimRight(h.webBaseURL, "/") + "/app/pair?t=" + jwtStr
++
++	// 512 px Quellbild, im Portal auf 256 px (w-64) dargestellt: exaktes 2:1-Downscaling
++	// hält die Module scharf — der Link-QR ist dichter als der reine JWT-QR.
++	png, err := qrcode.Encode(appLink, qrcode.Medium, 512)
+ 	if err != nil {
+ 		jsonError(w, "failed to render qr", http.StatusInternalServerError)
+ 		return
+@@ -120,7 +129,7 @@ func (h *MemberPortalHandler) GetAppToken(w http.ResponseWriter, r *http.Request
+ 	_ = json.NewEncoder(w).Encode(map[string]string{
+ 		"qr":           "data:image/png;base64," + base64.StdEncoding.EncodeToString(png),
+ 		"pairing_code": pairingCode,
+-		"app_link":     strings.TrimRight(h.webBaseURL, "/") + "/app/pair?t=" + jwtStr,
++		"app_link":     appLink,
+ 		"auto_renew":   strconv.FormatBool(autoRenew),
+ 		"ios_url":     strings.TrimSpace(os.Getenv(envAppIOSURL)),
+ 		"android_url": strings.TrimSpace(os.Getenv(envAppAndroidURL)),
+diff --git a/web/app/portal/dashboard/PortalDashboardClient.tsx b/web/app/portal/dashboard/PortalDashboardClient.tsx
+index 16f254f..7c80f92 100644
+--- a/web/app/portal/dashboard/PortalDashboardClient.tsx
++++ b/web/app/portal/dashboard/PortalDashboardClient.tsx
+@@ -925,7 +925,7 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+                 <img
+                   src={appQr.qr}
+                   alt="QR-Code zum Verbinden der App"
+-                  className="w-64 h-64 rounded-xl border border-slate-200 bg-white p-3"
++                  className="w-80 h-80 max-w-full rounded-xl border border-slate-200 bg-white p-3"
+                 />
+                 {appQr.pairing_code && (
+                   <div className="text-center">

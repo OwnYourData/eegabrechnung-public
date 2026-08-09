@@ -1,0 +1,67 @@
+diff --git a/api/internal/handler/portal_app_email_pairing.go b/api/internal/handler/portal_app_email_pairing.go
+index d18c262..4cce342 100644
+--- a/api/internal/handler/portal_app_email_pairing.go
++++ b/api/internal/handler/portal_app_email_pairing.go
+@@ -33,14 +33,22 @@ const emailPairingTTL = 10 * time.Minute
+ //
+ // The app's email pairing endpoint (POST /api/app/pair/email on the GrünLicht API)
+ // proxies here AFTER its own rate-limit + generic response. This logic lives on the
+-// billing side because only it holds the ES256 signing key, the members' e-mail
+-// addresses and the per-EEG SMTP credentials — none of which are exposed to the
+-// read-only GrünLicht API.
++// billing side because only it holds the members' e-mail addresses and the per-EEG
++// SMTP credentials — neither is exposed to the read-only GrünLicht API.
+ //
+-// For every ACTIVE member with the given address we mint a fresh QR-format pairing
+-// token (payload {tok,iat,exp,src:"email"}) tagged source='email' in the DB and mail
+-// the link https://<web>/app/pair?t=<jwt>. A person in several EEGs gets one mail per
+-// membership (each via that EEG's SMTP). Demo EEGs never send.
++// For every ACTIVE member with the given address we mint a fresh 256-bit login token,
++// persist only its SHA-256 hash tagged source='email' (that tag is what lets the
++// GrünLicht API auto-confirm the pairing) and mail the link
++// https://<web>/app/pair?t=<token>.
++//
++// The RAW token is mailed deliberately, not a signed JWT: it shortens the link by some
++// 300 characters (long random-looking URLs are a spam trigger), and the signature added
++// nothing on this path. Trust rests on the 256-bit secret, the DB hash lookup,
++// single-use and the 10-minute TTL — not on an offline-verifiable envelope, which is
++// only needed for the QR path (see portal_app_token.go, unchanged).
++//
++// A person in several EEGs gets one mail per membership (each via that EEG's SMTP).
++// Demo EEGs never send.
+ //
+ // SECURITY:
+ //   - Caller auth: constant-time X-Service-Token compare. Reachable only in-cluster.
+@@ -67,18 +75,6 @@ func (h *MemberPortalHandler) AppPairEmail(w http.ResponseWriter, r *http.Reques
+ 	}
+ 	email := strings.TrimSpace(req.Email)
+ 
+-	kid := strings.TrimSpace(os.Getenv(envAppQRKid))
+-	privMB := strings.TrimSpace(os.Getenv(envAppQRPrivKey))
+-	if kid == "" || privMB == "" {
+-		http.Error(w, "app connect not configured", http.StatusServiceUnavailable)
+-		return
+-	}
+-	priv, err := parseP256PrivKeyMultibase(privMB)
+-	if err != nil {
+-		http.Error(w, "app signing key error", http.StatusInternalServerError)
+-		return
+-	}
+-
+ 	// One pairing mail per ACTIVE membership with this address. Unknown address ->
+ 	// the loop runs zero times and we still answer 202.
+ 	choices, err := h.portalRepo.FindMembersByEmail(r.Context(), email)
+@@ -103,12 +99,7 @@ func (h *MemberPortalHandler) AppPairEmail(w http.ResponseWriter, r *http.Reques
+ 			slog.Error("AppPairEmail: store token failed", "error", err, "member_id", c.MemberID)
+ 			continue
+ 		}
+-		jwtStr, err := signAppJWT(priv, kid, loginToken, "email", emailPairingTTL)
+-		if err != nil {
+-			slog.Error("AppPairEmail: sign failed", "error", err)
+-			continue
+-		}
+-		link := strings.TrimRight(h.webBaseURL, "/") + "/app/pair?t=" + jwtStr
++		link := strings.TrimRight(h.webBaseURL, "/") + "/app/pair?t=" + loginToken
+ 		name := strings.TrimSpace(c.Name1 + " " + c.Name2)
+ 		go h.sendAppPairEmail(c.EegID, c.EegName, c.Email, name, link)
+ 	}

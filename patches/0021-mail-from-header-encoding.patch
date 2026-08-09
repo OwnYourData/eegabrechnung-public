@@ -1,0 +1,220 @@
+diff --git a/api/internal/handler/member_email.go b/api/internal/handler/member_email.go
+index a3f2a5f..b2d509a 100644
+--- a/api/internal/handler/member_email.go
++++ b/api/internal/handler/member_email.go
+@@ -286,10 +286,10 @@ func (h *MemberEmailHandler) SendCampaign(w http.ResponseWriter, r *http.Request
+ 
+ // sendHTMLEmail builds a multipart MIME message and sends it via SMTP, logging the attempt.
+ func (h *MemberEmailHandler) sendHTMLEmail(ctx context.Context, smtpCfg invoice.SMTPConfig, eegID uuid.UUID, memberID *uuid.UUID, toEmail, fromName, subject, htmlBody string, attachments []campaignFile) error {
+-	from := smtpCfg.From
+-	if fromName != "" {
+-		from = fmt.Sprintf("%s <%s>", fromName, smtpCfg.From)
+-	}
++	// The configured smtp_from may already contain a display name
++	// ("EEG X <a@b>"); in that case it is used verbatim and eeg.Name is NOT
++	// prefixed a second time. Encoding happens in mailutil.Headers.
++	from := mailutil.ComposeFrom(smtpCfg.From, fromName)
+ 
+ 	var msgBuf bytes.Buffer
+ 
+diff --git a/api/internal/mailutil/header.go b/api/internal/mailutil/header.go
+index ef6d88e..f8a2f97 100644
+--- a/api/internal/mailutil/header.go
++++ b/api/internal/mailutil/header.go
+@@ -10,7 +10,9 @@ package mailutil
+ 
+ import (
+ 	"mime"
++	"net/mail"
+ 	"strings"
++	"unicode"
+ )
+ 
+ // SanitizeHeaderValue removes CR and LF (and other C0 control characters except
+@@ -40,7 +42,79 @@ func EncodeSubject(s string) string {
+ // Call sites append their remaining headers (MIME-Version, Content-Type, …) and
+ // the body after this.
+ func Headers(from, to, subject string) string {
+-	return "From: " + SanitizeHeaderValue(from) + "\r\n" +
+-		"To: " + SanitizeHeaderValue(to) + "\r\n" +
++	return "From: " + EncodeAddress(from) + "\r\n" +
++		"To: " + EncodeAddress(to) + "\r\n" +
+ 		"Subject: " + EncodeSubject(subject) + "\r\n"
+ }
++
++// EncodeAddress sanitises an address header value and RFC 2047 encodes ONLY the
++// display name; the address itself is never rewritten.
++//
++// A display name that is already legal unquoted (printable US-ASCII, no RFC 5322
++// specials) is emitted verbatim, so a From configured by the operator round-trips
++// byte-identically. This is deliberately NOT net/mail's Address.String(): that would
++// wrap even a plain name in double quotes ("EEG X" <a@b>) and turn a bare address
++// into <a@b>. Both forms are valid, but they needlessly rewrite headers that work
++// today, so we only reformat when the name actually requires it.
++//
++// Values carrying no display name, or which do not parse as an address at all, are
++// returned sanitised but otherwise unchanged. SanitizeHeaderValue runs first on
++// every path, so the header-injection guarantee is preserved.
++func EncodeAddress(s string) string {
++	s = SanitizeHeaderValue(s)
++	addr, err := mail.ParseAddress(s)
++	if err != nil || addr.Name == "" {
++		return s
++	}
++	if isPlainDisplayName(addr.Name) {
++		return addr.Name + " <" + addr.Address + ">"
++	}
++	// Non-ASCII, or characters that require a quoted-string: let net/mail build the
++	// correct RFC 2047 encoded-word / quoted form.
++	return addr.String()
++}
++
++// isPlainDisplayName reports whether name may appear in an address header without
++// quoting or encoding: printable US-ASCII only, none of the RFC 5322 3.2.3 specials,
++// and no leading or trailing whitespace.
++func isPlainDisplayName(name string) bool {
++	if name == "" || name != strings.TrimSpace(name) {
++		return false
++	}
++	for _, r := range name {
++		if r > unicode.MaxASCII || r < ' ' || r == 0x7f {
++			return false
++		}
++		if strings.ContainsRune(`()<>[]:;@\,."`, r) {
++			return false
++		}
++	}
++	return true
++}
++
++// ComposeFrom decides which From value to use.
++//
++//   - configuredFrom already carries a display name ("EEG X <a@b>"): returned
++//     verbatim — the operator-configured value always wins and no name is prefixed.
++//   - configuredFrom is a bare address and fallbackName is set: the fallback name is
++//     prefixed, giving "fallbackName <address>" (previous behaviour, kept for
++//     backwards compatibility).
++//   - otherwise configuredFrom is returned unchanged.
++//
++// Encoding of a non-ASCII name happens later in Headers()/EncodeAddress; ComposeFrom
++// only produces the raw "Name <addr>" string.
++func ComposeFrom(configuredFrom, fallbackName string) string {
++	configuredFrom = strings.TrimSpace(configuredFrom)
++	fallbackName = strings.TrimSpace(fallbackName)
++	if fallbackName == "" {
++		return configuredFrom
++	}
++	addr, err := mail.ParseAddress(configuredFrom)
++	if err != nil {
++		return configuredFrom // not parsable — do not mangle it
++	}
++	if addr.Name != "" {
++		return configuredFrom // already has a display name
++	}
++	return fallbackName + " <" + addr.Address + ">"
++}
+diff --git a/api/internal/mailutil/header_test.go b/api/internal/mailutil/header_test.go
+index ce19f68..249e3ed 100644
+--- a/api/internal/mailutil/header_test.go
++++ b/api/internal/mailutil/header_test.go
+@@ -66,3 +66,100 @@ func countCRLF(s string) int {
+ 	}
+ 	return n
+ }
++
++// --- EncodeAddress -------------------------------------------------------
++
++// A plain ASCII display name must survive byte-identically. Guards against
++// net/mail's Address.String(), which would render it as "Name" <addr> and thereby
++// silently rewrite the operator's configured From.
++func TestEncodeAddressPlainASCIINameIsVerbatim(t *testing.T) {
++	in := "EEG Gruenes Licht Bad Voeslau Sooss <kontakt@eeg-gruenlicht.at>"
++	if got := EncodeAddress(in); got != in {
++		t.Fatalf("EncodeAddress = %q, want byte-identical %q", got, in)
++	}
++}
++
++func TestEncodeAddressUmlautNameIsEncoded(t *testing.T) {
++	got := EncodeAddress("EEG Grünes Licht Bad Vöslau <kontakt@eeg-gruenlicht.at>")
++	if !contains(got, "=?utf-8?q?") {
++		t.Fatalf("expected RFC2047 encoded display name, got %q", got)
++	}
++	// The address itself must stay readable and unencoded.
++	if !contains(got, "<kontakt@eeg-gruenlicht.at>") {
++		t.Fatalf("address was altered: %q", got)
++	}
++	if contains(got, "ü") || contains(got, "ö") {
++		t.Fatalf("raw 8-bit umlaut survived into header: %q", got)
++	}
++}
++
++// A bare address has no display name and must not be reshaped into <addr> —
++// that would needlessly change every direct mail (portal login, invoice, SEPA).
++func TestEncodeAddressBareAddressUnchanged(t *testing.T) {
++	in := "kontakt@eeg-gruenlicht.at"
++	if got := EncodeAddress(in); got != in {
++		t.Fatalf("EncodeAddress = %q, want %q", got, in)
++	}
++}
++
++func TestEncodeAddressStripsInjection(t *testing.T) {
++	got := EncodeAddress("Hans <h@x.at>\r\nBcc: evil@x.at")
++	if contains(got, "\r") || contains(got, "\n") {
++		t.Fatalf("CR/LF survived: %q", got)
++	}
++}
++
++// --- ComposeFrom ---------------------------------------------------------
++
++func TestComposeFromBareAddressGetsFallbackName(t *testing.T) {
++	got := ComposeFrom("kontakt@eeg-gruenlicht.at", "EEG Grünes Licht Bad Vöslau")
++	want := "EEG Grünes Licht Bad Vöslau <kontakt@eeg-gruenlicht.at>"
++	if got != want {
++		t.Fatalf("ComposeFrom = %q, want %q", got, want)
++	}
++}
++
++// The configured value wins: no second prefix, even if a fallback name is passed.
++func TestComposeFromKeepsConfiguredDisplayName(t *testing.T) {
++	in := "EEG Gruenes Licht Bad Voeslau Sooss <kontakt@eeg-gruenlicht.at>"
++	if got := ComposeFrom(in, "EEG Grünes Licht Bad Vöslau"); got != in {
++		t.Fatalf("ComposeFrom = %q, want unchanged %q", got, in)
++	}
++}
++
++func TestComposeFromEmptyFallbackName(t *testing.T) {
++	in := "kontakt@eeg-gruenlicht.at"
++	if got := ComposeFrom(in, ""); got != in {
++		t.Fatalf("ComposeFrom = %q, want %q", got, in)
++	}
++}
++
++func TestComposeFromUnparsableUnchanged(t *testing.T) {
++	in := "not an address"
++	if got := ComposeFrom(in, "EEG X"); got != in {
++		t.Fatalf("ComposeFrom = %q, want unchanged %q", got, in)
++	}
++}
++
++// --- End-to-end through Headers -----------------------------------------
++
++// Acceptance: a fully configured ASCII From must appear literally, with no prefix
++// and no encoding.
++func TestHeadersFromExactForConfiguredASCIIName(t *testing.T) {
++	from := ComposeFrom("EEG Gruenes Licht Bad Voeslau Sooss <kontakt@eeg-gruenlicht.at>",
++		"EEG Grünes Licht Bad Vöslau")
++	h := Headers(from, "m@example.at", "Test")
++	want := "From: EEG Gruenes Licht Bad Voeslau Sooss <kontakt@eeg-gruenlicht.at>\r\n"
++	if !contains(h, want) {
++		t.Fatalf("headers = %q, want From line %q", h, want)
++	}
++}
++
++// Acceptance: a bare From plus an umlaut EEG name yields an encoded display name.
++func TestHeadersFromEncodesFallbackNameWithUmlaut(t *testing.T) {
++	from := ComposeFrom("kontakt@eeg-gruenlicht.at", "EEG Grünes Licht Bad Vöslau")
++	h := Headers(from, "m@example.at", "Test")
++	if !contains(h, "=?utf-8?q?") || !contains(h, "<kontakt@eeg-gruenlicht.at>") {
++		t.Fatalf("expected encoded name before plain address, got %q", h)
++	}
++}

@@ -1,0 +1,79 @@
+diff --git a/web/app/portal/[token]/AutoLoginForm.tsx b/web/app/portal/[token]/AutoLoginForm.tsx
+new file mode 100644
+index 0000000..be7b6bc
+--- /dev/null
++++ b/web/app/portal/[token]/AutoLoginForm.tsx
+@@ -0,0 +1,38 @@
++"use client";
++
++import { useEffect, useRef } from "react";
++
++/**
++ * Meldet das Mitglied automatisch an, sobald die Seite im Browser läuft.
++ *
++ * WARUM per JavaScript und weiterhin per POST (und NICHT per GET-Link):
++ * Der Magic-Link ist einmalig verwendbar. E-Mail-Sicherheitsgateways
++ * (Outlook SafeLinks, Virenscanner, Spam-Filter), Chat-Vorschauen und
++ * Browser-Prefetch folgen automatisch GET-Links — sie würden den Link
++ * verbrauchen, BEVOR das Mitglied ihn anklickt („Link ungültig").
++ * Ein POST wird davon nicht ausgelöst, und JavaScript führen Scanner nicht aus.
++ * So bleibt der Schutz erhalten und der Klick entfällt trotzdem.
++ *
++ * Der Button bleibt als Fallback sichtbar, falls JavaScript blockiert ist.
++ */
++export default function AutoLoginForm({ token }: { token: string }) {
++  const formRef = useRef<HTMLFormElement>(null);
++  const submitted = useRef(false);
++
++  useEffect(() => {
++    if (submitted.current) return; // niemals doppelt absenden
++    submitted.current = true;
++    formRef.current?.requestSubmit();
++  }, []);
++
++  return (
++    <form ref={formRef} action={`/portal/${token}/activate`} method="POST">
++      <button
++        type="submit"
++        className="w-full bg-green-600 text-white py-3 px-6 rounded-lg font-medium hover:bg-green-700 active:bg-green-800 transition-colors"
++      >
++        Jetzt anmelden
++      </button>
++    </form>
++  );
++}
+diff --git a/web/app/portal/[token]/page.tsx b/web/app/portal/[token]/page.tsx
+index 77aa80f..82f9496 100644
+--- a/web/app/portal/[token]/page.tsx
++++ b/web/app/portal/[token]/page.tsx
+@@ -1,3 +1,5 @@
++import AutoLoginForm from "./AutoLoginForm";
++
+ export default async function PortalActivatePage({
+   params,
+ }: {
+@@ -28,18 +30,15 @@ export default async function PortalActivatePage({
+             Mitglieder-Portal
+           </h1>
+           <p className="text-gray-500 mt-2 text-sm">
+-            Klicken Sie auf den Button, um sich anzumelden.
++            Sie werden angemeldet &hellip;
+           </p>
+         </div>
+ 
+-        <form action={`/portal/${token}/activate`} method="POST">
+-          <button
+-            type="submit"
+-            className="w-full bg-green-600 text-white py-3 px-6 rounded-lg font-medium hover:bg-green-700 active:bg-green-800 transition-colors"
+-          >
+-            Jetzt anmelden
+-          </button>
+-        </form>
++        <AutoLoginForm token={token} />
++
++        <p className="text-xs text-gray-400 mt-3">
++          Falls es nicht automatisch weitergeht, klicken Sie bitte auf den Button.
++        </p>
+ 
+         <p className="text-xs text-gray-400 mt-5">
+           Dieser Link ist 30 Minuten gültig und kann nur einmal verwendet

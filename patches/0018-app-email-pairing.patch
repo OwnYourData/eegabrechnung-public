@@ -1,0 +1,249 @@
+diff --git a/api/cmd/server/main.go b/api/cmd/server/main.go
+index 4e913d6..aa7ab4e 100644
+--- a/api/cmd/server/main.go
++++ b/api/cmd/server/main.go
+@@ -217,6 +217,10 @@ func main() {
+ 	r.With(portalLimiter.Middleware, portalHandler.DenyDemoMember).Post("/api/v1/public/portal/email-change", portalHandler.RequestEmailChange)
+ 	r.Post("/api/v1/public/portal/email-change/confirm/{token}", portalHandler.ConfirmEmailChange)
+ 
++	// Internal (in-cluster only, X-Service-Token): GrünLicht API proxies the app's
++	// POST /api/app/pair/email here to mint an email-pairing token + mail the link.
++	r.Post("/internal/app/pair/email", portalHandler.AppPairEmail)
++
+ 	authMiddleware := auth.Middleware(jwtSecret)
+ 
+ 	r.Route("/api/v1", func(r chi.Router) {
+diff --git a/api/internal/db/migrations/091_app_login_token_source.down.sql b/api/internal/db/migrations/091_app_login_token_source.down.sql
+new file mode 100644
+index 0000000..f8873fe
+--- /dev/null
++++ b/api/internal/db/migrations/091_app_login_token_source.down.sql
+@@ -0,0 +1 @@
++ALTER TABLE app_login_tokens DROP COLUMN IF EXISTS source;
+diff --git a/api/internal/db/migrations/091_app_login_token_source.up.sql b/api/internal/db/migrations/091_app_login_token_source.up.sql
+new file mode 100644
+index 0000000..225181a
+--- /dev/null
++++ b/api/internal/db/migrations/091_app_login_token_source.up.sql
+@@ -0,0 +1,5 @@
++-- Provenance of an app login token: 'qr' (portal QR / manual code, the default and
++-- existing behaviour) or 'email' (magic-link mailed to the registered address).
++-- The GrünLicht API reads this via app_readonly.app_login_token_view and auto-confirms
++-- ONLY email-sourced pairings (the link went solely to the member's own address).
++ALTER TABLE app_login_tokens ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'qr';
+diff --git a/api/internal/handler/portal_app_email_pairing.go b/api/internal/handler/portal_app_email_pairing.go
+new file mode 100644
+index 0000000..d18c262
+--- /dev/null
++++ b/api/internal/handler/portal_app_email_pairing.go
+@@ -0,0 +1,157 @@
++package handler
++
++import (
++	"context"
++	"crypto/rand"
++	"crypto/sha256"
++	"crypto/subtle"
++	"encoding/base64"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"log/slog"
++	"net/http"
++	"os"
++	"strings"
++	"time"
++
++	"github.com/google/uuid"
++	"github.com/lutzerb/eegabrechnung/internal/invoice"
++	"github.com/lutzerb/eegabrechnung/internal/mailutil"
++)
++
++// envInternalServiceToken is the shared secret the GrünLicht API presents (header
++// X-Service-Token) when calling this internal endpoint. It is the SAME secret used in
++// the other direction (portal -> GrünLicht API, see portal_app_pairing.go).
++const envInternalServiceToken = "INTERNAL_SERVICE_TOKEN"
++
++// emailPairingTTL is the lifetime of an email-pairing token — short, because the link
++// is tapped straight from the mail. Single-use is enforced by the GrünLicht API.
++const emailPairingTTL = 10 * time.Minute
++
++// AppPairEmail handles POST /internal/app/pair/email.
++//
++// The app's email pairing endpoint (POST /api/app/pair/email on the GrünLicht API)
++// proxies here AFTER its own rate-limit + generic response. This logic lives on the
++// billing side because only it holds the ES256 signing key, the members' e-mail
++// addresses and the per-EEG SMTP credentials — none of which are exposed to the
++// read-only GrünLicht API.
++//
++// For every ACTIVE member with the given address we mint a fresh QR-format pairing
++// token (payload {tok,iat,exp,src:"email"}) tagged source='email' in the DB and mail
++// the link https://<web>/app/pair?t=<jwt>. A person in several EEGs gets one mail per
++// membership (each via that EEG's SMTP). Demo EEGs never send.
++//
++// SECURITY:
++//   - Caller auth: constant-time X-Service-Token compare. Reachable only in-cluster.
++//   - No member-existence signal: always 202 once authenticated, whether or not the
++//     address matched. Enumeration protection + rate-limit live on the GrünLicht API.
++func (h *MemberPortalHandler) AppPairEmail(w http.ResponseWriter, r *http.Request) {
++	expected := strings.TrimSpace(os.Getenv(envInternalServiceToken))
++	if expected == "" {
++		http.Error(w, "internal endpoint not configured", http.StatusServiceUnavailable)
++		return
++	}
++	got := strings.TrimSpace(r.Header.Get("X-Service-Token"))
++	if subtle.ConstantTimeCompare([]byte(got), []byte(expected)) != 1 {
++		http.Error(w, "forbidden", http.StatusUnauthorized)
++		return
++	}
++
++	var req struct {
++		Email string `json:"email"`
++	}
++	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Email) == "" {
++		http.Error(w, "invalid request", http.StatusBadRequest)
++		return
++	}
++	email := strings.TrimSpace(req.Email)
++
++	kid := strings.TrimSpace(os.Getenv(envAppQRKid))
++	privMB := strings.TrimSpace(os.Getenv(envAppQRPrivKey))
++	if kid == "" || privMB == "" {
++		http.Error(w, "app connect not configured", http.StatusServiceUnavailable)
++		return
++	}
++	priv, err := parseP256PrivKeyMultibase(privMB)
++	if err != nil {
++		http.Error(w, "app signing key error", http.StatusInternalServerError)
++		return
++	}
++
++	// One pairing mail per ACTIVE membership with this address. Unknown address ->
++	// the loop runs zero times and we still answer 202.
++	choices, err := h.portalRepo.FindMembersByEmail(r.Context(), email)
++	if err != nil {
++		slog.Error("AppPairEmail: member lookup failed", "error", err)
++		choices = nil
++	}
++	for _, c := range choices {
++		if c.IsDemo {
++			continue
++		}
++		rawTok := make([]byte, 32)
++		if _, err := rand.Read(rawTok); err != nil {
++			slog.Error("AppPairEmail: token rand failed", "error", err)
++			continue
++		}
++		loginToken := base64.RawURLEncoding.EncodeToString(rawTok)
++		sum := sha256.Sum256([]byte(loginToken))
++		tokenHash := hex.EncodeToString(sum[:])
++
++		if err := h.portalRepo.CreateAppLoginTokenEmail(r.Context(), tokenHash, c.MemberID, int(emailPairingTTL.Seconds())); err != nil {
++			slog.Error("AppPairEmail: store token failed", "error", err, "member_id", c.MemberID)
++			continue
++		}
++		jwtStr, err := signAppJWT(priv, kid, loginToken, "email", emailPairingTTL)
++		if err != nil {
++			slog.Error("AppPairEmail: sign failed", "error", err)
++			continue
++		}
++		link := strings.TrimRight(h.webBaseURL, "/") + "/app/pair?t=" + jwtStr
++		name := strings.TrimSpace(c.Name1 + " " + c.Name2)
++		go h.sendAppPairEmail(c.EegID, c.EegName, c.Email, name, link)
++	}
++
++	w.WriteHeader(http.StatusAccepted)
++}
++
++// sendAppPairEmail mails the pairing link via the member's EEG SMTP. Mirrors
++// sendPortalLinkEmail. The mail carries no secret beyond the short-lived one-time link.
++func (h *MemberPortalHandler) sendAppPairEmail(eegID uuid.UUID, eegName, toEmail, name, link string) {
++	eeg, err := h.eegRepo.GetByIDInternal(context.Background(), eegID)
++	if err != nil || eeg == nil || eeg.SMTPHost == "" {
++		slog.Error("sendAppPairEmail: EEG SMTP not configured", "eeg_id", eegID)
++		return
++	}
++	fullName := strings.TrimSpace(name)
++	if fullName == "" {
++		fullName = "Mitglied"
++	}
++	community := strings.TrimSpace(eegName)
++	if community == "" {
++		community = eeg.Name
++	}
++	subject := "EEG GrünLicht App verbinden"
++	body := fmt.Sprintf(`Sehr geehrte/r %s,
++
++tippen Sie den folgenden Link auf dem Handy an, auf dem die EEG-GrünLicht-App installiert ist, um die App mit Ihrem Zugang bei %s zu verbinden:
++
++%s
++
++Der Link ist 10 Minuten gültig und kann nur einmal verwendet werden.
++
++Falls Sie diese Verbindung nicht angefordert haben, können Sie diese E-Mail ignorieren.
++
++Mit freundlichen Grüßen
++Ihr EEG-Team`, fullName, community, link)
++
++	msg := []byte(mailutil.Headers(eeg.SMTPFrom, toEmail, subject) +
++		"Content-Type: text/plain; charset=UTF-8\r\n" +
++		"\r\n" +
++		body)
++	cfg := invoice.SMTPConfig{Host: eeg.SMTPHost, From: eeg.SMTPFrom, Username: eeg.SMTPUser, Password: eeg.SMTPPassword}
++	if err := invoice.SendLogged(context.Background(), h.emailLogRepo, cfg, eeg.ID, "app_pair_email", toEmail, subject, nil, nil, msg); err != nil {
++		slog.Error("sendAppPairEmail: failed to send", "error", err, "to", toEmail)
++	}
++}
+diff --git a/api/internal/handler/portal_app_token.go b/api/internal/handler/portal_app_token.go
+index c6d741f..91bcc88 100644
+--- a/api/internal/handler/portal_app_token.go
++++ b/api/internal/handler/portal_app_token.go
+@@ -91,7 +91,7 @@ func (h *MemberPortalHandler) GetAppToken(w http.ResponseWriter, r *http.Request
+ 		}
+ 	}
+ 
+-	jwtStr, err := signAppJWT(priv, kid, loginToken, ttl)
++	jwtStr, err := signAppJWT(priv, kid, loginToken, "", ttl)
+ 	if err != nil {
+ 		jsonError(w, "failed to sign token", http.StatusInternalServerError)
+ 		return
+@@ -141,7 +141,7 @@ func appTokenTTL() time.Duration {
+ 
+ // signAppJWT builds a compact ES256 JWT: header{alg,typ,kid}.payload{tok,iat,exp}.signature.
+ // The payload carries ONLY a short-lived random token — no member identifier, no PII.
+-func signAppJWT(priv *ecdsa.PrivateKey, kid, tok string, ttl time.Duration) (string, error) {
++func signAppJWT(priv *ecdsa.PrivateKey, kid, tok, src string, ttl time.Duration) (string, error) {
+ 	header := struct {
+ 		Alg string `json:"alg"`
+ 		Typ string `json:"typ"`
+@@ -153,7 +153,8 @@ func signAppJWT(priv *ecdsa.PrivateKey, kid, tok string, ttl time.Duration) (str
+ 		Tok string `json:"tok"`
+ 		Iat int64  `json:"iat"`
+ 		Exp int64  `json:"exp"`
+-	}{Tok: tok, Iat: now, Exp: now + int64(ttl.Seconds())}
++		Src string `json:"src,omitempty"`
++	}{Tok: tok, Iat: now, Exp: now + int64(ttl.Seconds()), Src: src}
+ 
+ 	hb, err := json.Marshal(header)
+ 	if err != nil {
+diff --git a/api/internal/repository/member_portal.go b/api/internal/repository/member_portal.go
+index cb1ed31..c750e8c 100644
+--- a/api/internal/repository/member_portal.go
++++ b/api/internal/repository/member_portal.go
+@@ -249,3 +249,16 @@ func (r *MemberPortalRepository) IsDemoMember(ctx context.Context, memberID uuid
+ 	}
+ 	return demo, nil
+ }
++
++// CreateAppLoginTokenEmail stores the SHA-256 hash of an email-pairing login token.
++// Unlike the QR flow there is no manual short code (code_hash stays NULL), and the
++// row is tagged source='email' so the GrünLicht API can auto-confirm the pairing:
++// the link went only to the member's registered address, which is the identity proof.
++// SECURITY: only the hash is persisted, never the plaintext token.
++func (r *MemberPortalRepository) CreateAppLoginTokenEmail(ctx context.Context, tokenHash string, memberID uuid.UUID, ttlSeconds int) error {
++	_, err := r.db.Exec(ctx,
++		`INSERT INTO app_login_tokens (token_hash, member_id, expires_at, source)
++		 VALUES ($1, $2, now() + make_interval(secs => $3), 'email')`,
++		tokenHash, memberID, ttlSeconds)
++	return err
++}

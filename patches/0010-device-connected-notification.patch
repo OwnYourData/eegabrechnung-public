@@ -1,0 +1,186 @@
+diff --git a/api/internal/handler/portal_app_pairing.go b/api/internal/handler/portal_app_pairing.go
+index 5d13462..f8b1816 100644
+--- a/api/internal/handler/portal_app_pairing.go
++++ b/api/internal/handler/portal_app_pairing.go
+@@ -1,9 +1,11 @@
+ package handler
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"io"
++	"log/slog"
+ 	"net/http"
+ 	"net/url"
+ 	"os"
+@@ -11,6 +13,9 @@ import (
+ 	"time"
+ 
+ 	"github.com/go-chi/chi/v5"
++	"github.com/google/uuid"
++	"github.com/lutzerb/eegabrechnung/internal/invoice"
++	"github.com/lutzerb/eegabrechnung/internal/mailutil"
+ )
+ 
+ // Cluster-internal GrünLicht app API. Both values come from the environment/secret —
+@@ -120,7 +125,7 @@ func (h *MemberPortalHandler) GetAppPairings(w http.ResponseWriter, r *http.Requ
+ //     member_ref comes from the session, NEVER from the request — so a caller cannot
+ //     confirm a pairing that belongs to someone else.
+ func (h *MemberPortalHandler) appPairingAction(w http.ResponseWriter, r *http.Request, action string) {
+-	memberID, _, ok := h.portalAuth(r)
++	memberID, eegID, ok := h.portalAuth(r)
+ 	if !ok {
+ 		jsonError(w, "unauthorized", http.StatusUnauthorized)
+ 		return
+@@ -136,14 +141,14 @@ func (h *MemberPortalHandler) appPairingAction(w http.ResponseWriter, r *http.Re
+ 		jsonError(w, "pairing service unavailable", http.StatusServiceUnavailable)
+ 		return
+ 	}
+-	owned := false
+-	for _, it := range items {
+-		if it.ID.String() == id {
+-			owned = true
++	var matched *appPairing
++	for i := range items {
++		if items[i].ID.String() == id {
++			matched = &items[i]
+ 			break
+ 		}
+ 	}
+-	if !owned {
++	if matched == nil {
+ 		jsonError(w, "pairing does not belong to this member", http.StatusForbidden)
+ 		return
+ 	}
+@@ -155,6 +160,11 @@ func (h *MemberPortalHandler) appPairingAction(w http.ResponseWriter, r *http.Re
+ 	}
+ 	switch st {
+ 	case http.StatusNoContent:
++		if action == "confirm" {
++			// Vishing-Gegenmaßnahme: den Vorgang entdeckbar und umkehrbar machen.
++			// Fire-and-forget — scheitert der Versand, gelingt die Bestätigung trotzdem.
++			go h.notifyDeviceEvent(eegID, memberID, matched.DeviceLabel, matched.RequestedAt, true)
++		}
+ 		w.WriteHeader(http.StatusNoContent)
+ 	case http.StatusNotFound:
+ 		jsonError(w, "pairing not found or no longer open", http.StatusNotFound)
+@@ -204,7 +214,7 @@ func (h *MemberPortalHandler) GetAppSessions(w http.ResponseWriter, r *http.Requ
+ // SECURITY: same ownership rule — the session must belong to the logged-in member.
+ // Router: DELETE /api/v1/public/portal/app-sessions/{sessionID}
+ func (h *MemberPortalHandler) RevokeAppSession(w http.ResponseWriter, r *http.Request) {
+-	memberID, _, ok := h.portalAuth(r)
++	memberID, eegID, ok := h.portalAuth(r)
+ 	if !ok {
+ 		jsonError(w, "unauthorized", http.StatusUnauthorized)
+ 		return
+@@ -220,14 +230,14 @@ func (h *MemberPortalHandler) RevokeAppSession(w http.ResponseWriter, r *http.Re
+ 		jsonError(w, "session service unavailable", http.StatusServiceUnavailable)
+ 		return
+ 	}
+-	owned := false
+-	for _, it := range items {
+-		if it.ID.String() == id {
+-			owned = true
++	var matched *appSession
++	for i := range items {
++		if items[i].ID.String() == id {
++			matched = &items[i]
+ 			break
+ 		}
+ 	}
+-	if !owned {
++	if matched == nil {
+ 		jsonError(w, "session does not belong to this member", http.StatusForbidden)
+ 		return
+ 	}
+@@ -239,6 +249,8 @@ func (h *MemberPortalHandler) RevokeAppSession(w http.ResponseWriter, r *http.Re
+ 	}
+ 	switch st {
+ 	case http.StatusNoContent:
++		// Schließt den Kreis: auch ein böswilliger Entzug wird sichtbar.
++		go h.notifyDeviceEvent(eegID, memberID, matched.DeviceLabel, "", false)
+ 		w.WriteHeader(http.StatusNoContent)
+ 	case http.StatusNotFound:
+ 		jsonError(w, "session not found", http.StatusNotFound)
+@@ -246,3 +258,80 @@ func (h *MemberPortalHandler) RevokeAppSession(w http.ResponseWriter, r *http.Re
+ 		jsonError(w, "session service error", http.StatusBadGateway)
+ 	}
+ }
++
++// notifyDeviceEvent informiert das eingeloggte Mitglied per E-Mail, dass ein Gerät
++// verbunden (connected=true) bzw. dessen Zugriff entzogen wurde (connected=false).
++//
++// Gegenmaßnahme gegen Vishing: Der manuelle 8-Zeichen-Code lässt sich am Telefon
++// vorlesen. Ein Warntext im Dialog hilft unter Zeitdruck wenig — die Mail macht den
++// Vorgang ENTDECKBAR und UMKEHRBAR.
++//
++// Regeln:
++//   - Empfänger ist die Adresse aus der Portal-Session (members.email). Die
++//     GrünLicht-API hat bewusst KEINEN Zugriff auf E-Mail-Adressen.
++//   - Gerätename/Zeitpunkt stammen aus dem bereits vorhandenen Pairing-/Session-
++//     Objekt — kein zusätzlicher API-Aufruf.
++//   - Fire-and-forget: Fehler werden geloggt, nie eskaliert.
++//   - KEINE Codes, KEINE Tokens, KEIN Auto-Login-Link. Nur ein Link ins Portal.
++func (h *MemberPortalHandler) notifyDeviceEvent(eegID, memberID uuid.UUID, deviceLabel, requestedAt string, connected bool) {
++	ctx := context.Background()
++
++	eeg, err := h.eegRepo.GetByIDInternal(ctx, eegID)
++	if err != nil || eeg == nil || eeg.SMTPHost == "" || eeg.IsDemo {
++		return // kein SMTP konfiguriert oder Demo-EEG: kein Versand
++	}
++	member, err := h.memberRepo.GetByID(ctx, memberID)
++	if err != nil || member == nil || strings.TrimSpace(member.Email) == "" {
++		return
++	}
++
++	if strings.TrimSpace(deviceLabel) == "" {
++		deviceLabel = "Unbekanntes Gerät"
++	}
++	when := time.Now().In(viennaLoc)
++	if t, perr := time.Parse(time.RFC3339, strings.TrimSpace(requestedAt)); perr == nil {
++		when = t.In(viennaLoc)
++	}
++	zeit := when.Format("02.01.2006, 15:04") + " Uhr"
++
++	name := strings.TrimSpace(member.Name1 + " " + member.Name2)
++	portalURL := strings.TrimRight(h.webBaseURL, "/") + "/portal"
++
++	var subject, body string
++	if connected {
++		subject = "Neues Gerät mit deinem EEG-GrünLicht-Konto verbunden"
++		body = `<p>Hallo ` + name + `,</p>
++<p>soeben wurde ein neues Gerät mit deinem Konto verbunden:</p>
++<p><strong>Gerät:</strong> ` + deviceLabel + `<br>
++<strong>Zeitpunkt:</strong> ` + zeit + `</p>
++<p>Warst du das? Dann ist alles in Ordnung, du musst nichts tun.</p>
++<p>Warst du das <strong>nicht</strong> &mdash; zum Beispiel, weil dich jemand telefonisch dazu
++gebracht hat, einen Code vorzulesen oder eine Verbindung zu bestätigen &mdash; dann entziehe dem
++Gerät sofort den Zugriff:</p>
++<p><a href="` + portalURL + `">Mitgliederportal öffnen → Tab „App verbinden" → Verbundene Geräte</a></p>
++<p><strong>Die EEG GrünLicht wird dich NIEMALS anrufen und nach einem Code fragen.</strong></p>`
++	} else {
++		subject = "Zugriff eines Geräts auf dein EEG-GrünLicht-Konto entzogen"
++		body = `<p>Hallo ` + name + `,</p>
++<p>der Zugriff des folgenden Geräts auf dein Konto wurde entzogen:</p>
++<p><strong>Gerät:</strong> ` + deviceLabel + `<br>
++<strong>Zeitpunkt:</strong> ` + zeit + `</p>
++<p>Warst du das? Dann ist alles in Ordnung.</p>
++<p>Warst du das <strong>nicht</strong>, melde dich bitte bei deiner Energiegemeinschaft:</p>
++<p><a href="` + portalURL + `">Mitgliederportal öffnen</a></p>`
++	}
++
++	msg := []byte(mailutil.Headers(eeg.SMTPFrom, member.Email, subject) +
++		"MIME-Version: 1.0\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n" + body)
++
++	cfg := invoice.SMTPConfig{Host: eeg.SMTPHost, From: eeg.SMTPFrom, Username: eeg.SMTPUser, Password: eeg.SMTPPassword}
++	emailType := "app_device_connected"
++	if !connected {
++		emailType = "app_device_revoked"
++	}
++	mid := memberID
++	if err := invoice.SendLogged(ctx, h.emailLogRepo, cfg, eeg.ID, emailType,
++		member.Email, subject, &mid, nil, msg); err != nil {
++		slog.Warn("device event mail failed", "type", emailType, "member_id", mid.String(), "error", err)
++	}
++}

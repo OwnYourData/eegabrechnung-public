@@ -1,0 +1,71 @@
+diff --git a/web/app/portal/dashboard/PortalDashboardClient.tsx b/web/app/portal/dashboard/PortalDashboardClient.tsx
+index 7c80f92..9d227ab 100644
+--- a/web/app/portal/dashboard/PortalDashboardClient.tsx
++++ b/web/app/portal/dashboard/PortalDashboardClient.tsx
+@@ -772,11 +772,10 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+         {activeTab === "app" && (
+           <div className="max-w-md space-y-5">
+             <div className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3">
+-              <p className="text-sm font-medium text-amber-900">Funktion in Entwicklung</p>
++              <p className="text-sm font-medium text-amber-900">EEG GrünLicht App</p>
+               <p className="text-xs text-amber-800 mt-1">
+-                Diese Funktion wird gerade entwickelt und ist noch nicht allgemein verfügbar. Die „EEG
+-                GrünLicht App“ wird voraussichtlich <strong>Ende August</strong> in den App Stores zum
+-                Download bereitstehen.
++                Die App ist ab sofort für <strong>iPhone</strong> im App Store verfügbar. Die
++                <strong> Android</strong>-Version folgt voraussichtlich <strong>Mitte August</strong>.
+               </p>
+             </div>
+ 
+@@ -942,27 +941,38 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+                   </span>{" "}
+                   gültig.
+                 </p>
+-                <div className="flex gap-3 flex-wrap justify-center">
+-                  {appQr.ios_url && (
++                <div className="flex flex-col items-center gap-3 w-full">
++                  {/* iOS App Store — auf iPhone/iPad und am Desktop. Sichtbar, sobald
++                      PORTAL_APP_IOS_URL gesetzt ist (= iOS live). */}
++                  {appQr.ios_url && (isIOS || !isMobile) && (
+                     <a
+                       href={appQr.ios_url}
+                       target="_blank"
+                       rel="noopener noreferrer"
+                       className="px-4 py-2 text-sm font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 transition-colors"
+                     >
+-                      App Store (iOS)
+-                    </a>
+-                  )}
+-                  {appQr.android_url && (
+-                    <a
+-                      href={appQr.android_url}
+-                      target="_blank"
+-                      rel="noopener noreferrer"
+-                      className="px-4 py-2 text-sm font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 transition-colors"
+-                    >
+-                      Play Store (Android)
++                      Im App Store laden
+                     </a>
+                   )}
++                  {/* Android — auf Android-Geräten und am Desktop (nicht auf iPhone/iPad).
++                      Play-Store-Link, sobald PORTAL_APP_ANDROID_URL gesetzt ist (= Android
++                      live); solange leer, stattdessen der Hinweis. */}
++                  {!isIOS &&
++                    (appQr.android_url ? (
++                      <a
++                        href={appQr.android_url}
++                        target="_blank"
++                        rel="noopener noreferrer"
++                        className="px-4 py-2 text-sm font-medium rounded-lg bg-slate-900 text-white hover:bg-slate-800 transition-colors"
++                      >
++                        Im Play Store laden
++                      </a>
++                    ) : (
++                      <p className="text-xs text-slate-500 text-center max-w-xs">
++                        Die Android-Version ist voraussichtlich Mitte August verfügbar — wir informieren
++                        Sie, sobald sie da ist.
++                      </p>
++                    ))}
+                 </div>
+               </div>
+             ) : null}

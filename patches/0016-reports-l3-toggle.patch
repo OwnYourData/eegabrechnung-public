@@ -1,0 +1,165 @@
+diff --git a/api/internal/handler/report.go b/api/internal/handler/report.go
+index 60b320c..16e8b32 100644
+--- a/api/internal/handler/report.go
++++ b/api/internal/handler/report.go
+@@ -160,7 +160,8 @@ func (h *ReportHandler) GetRawMemberEnergy(w http.ResponseWriter, r *http.Reques
+ 		zaehlpunkt = &s
+ 	}
+ 
+-	stats, err := h.reportRepo.RawMemberEnergy(r.Context(), eeg.ID, from, to, memberID, zaehlpunkt)
++	includeL3 := r.URL.Query().Get("include_l3") == "true"
++	stats, err := h.reportRepo.RawMemberEnergy(r.Context(), eeg.ID, from, to, memberID, zaehlpunkt, includeL3)
+ 	if err != nil {
+ 		jsonError(w, "query failed: "+err.Error(), http.StatusInternalServerError)
+ 		return
+@@ -227,7 +228,8 @@ func (h *ReportHandler) GetEnergySummary(w http.ResponseWriter, r *http.Request)
+ 		zaehlpunkt = &s
+ 	}
+ 
+-	rows, err := h.reportRepo.EnergySummary(r.Context(), eeg.ID, from, to, granularity, memberID, zaehlpunkt)
++	includeL3 := r.URL.Query().Get("include_l3") == "true"
++	rows, err := h.reportRepo.EnergySummary(r.Context(), eeg.ID, from, to, granularity, memberID, zaehlpunkt, includeL3)
+ 	if err != nil {
+ 		jsonError(w, "query failed: "+err.Error(), http.StatusInternalServerError)
+ 		return
+diff --git a/api/internal/repository/report.go b/api/internal/repository/report.go
+index e212597..7ff5cfc 100644
+--- a/api/internal/repository/report.go
++++ b/api/internal/repository/report.go
+@@ -90,19 +90,23 @@ func (r *ReportRepository) MemberStats(ctx context.Context, eegID uuid.UUID, fro
+ // (no billing calculation – use MemberStats for invoice-based amounts).
+ // Pass a non-nil memberID to restrict results to a single member.
+ // Pass a non-nil zaehlpunkt to restrict results to a single meter point.
+-func (r *ReportRepository) RawMemberEnergy(ctx context.Context, eegID uuid.UUID, from, to time.Time, memberID *uuid.UUID, zaehlpunkt *string) ([]domain.MemberStat, error) {
++func (r *ReportRepository) RawMemberEnergy(ctx context.Context, eegID uuid.UUID, from, to time.Time, memberID *uuid.UUID, zaehlpunkt *string, includeL3 bool) ([]domain.MemberStat, error) {
+ 	// Field convention (kWh, matches XLSX import):
+ 	//   CONSUMPTION er.wh_self      = EEG share consumed ("Bezug EEG" / "Ausgetauscht") = G.03
+ 	//   CONSUMPTION er.wh_community = allocated EEG energy (G.02, informational)
+ 	//   GENERATION  er.wh_community = EEG share fed in ("Einspeisung EEG")
+ 	//   GENERATION  er.wh_self      = Resteinspeisung ins öffentliche Netz
+-	q := `
++	qf := "AND er.quality <> 'L3'"
++	if includeL3 {
++		qf = ""
++	}
++	q := fmt.Sprintf(`
+ 		SELECT
+ 			m.id AS member_id,
+-			COALESCE(SUM(CASE WHEN mp.energierichtung = 'CONSUMPTION' AND er.quality <> 'L3' THEN er.wh_self      ELSE 0 END), 0) AS consumption_kwh,
+-			COALESCE(SUM(CASE WHEN mp.energierichtung = 'GENERATION'  AND er.quality <> 'L3' THEN er.wh_community ELSE 0 END), 0) AS generation_kwh,
+-			COALESCE(SUM(CASE WHEN mp.energierichtung = 'CONSUMPTION' AND er.quality <> 'L3' THEN er.wh_total     ELSE 0 END), 0) AS consumption_total_kwh,
+-			COALESCE(SUM(CASE WHEN mp.energierichtung = 'GENERATION'  AND er.quality <> 'L3' THEN er.wh_total     ELSE 0 END), 0) AS generation_total_kwh,
++			COALESCE(SUM(CASE WHEN mp.energierichtung = 'CONSUMPTION' %[1]s THEN er.wh_self      ELSE 0 END), 0) AS consumption_kwh,
++			COALESCE(SUM(CASE WHEN mp.energierichtung = 'GENERATION'  %[1]s THEN er.wh_community ELSE 0 END), 0) AS generation_kwh,
++			COALESCE(SUM(CASE WHEN mp.energierichtung = 'CONSUMPTION' %[1]s THEN er.wh_total     ELSE 0 END), 0) AS consumption_total_kwh,
++			COALESCE(SUM(CASE WHEN mp.energierichtung = 'GENERATION'  %[1]s THEN er.wh_total     ELSE 0 END), 0) AS generation_total_kwh,
+ 			0::float8 AS total_amount,
+ 			0::int    AS invoice_count,
+ 			COALESCE(SUM(CASE WHEN er.quality = 'L3' THEN 1 ELSE 0 END), 0)::int AS l3_reading_count
+@@ -115,7 +119,7 @@ func (r *ReportRepository) RawMemberEnergy(ctx context.Context, eegID uuid.UUID,
+ 		  AND ($4::uuid IS NULL OR m.id = $4)
+ 		  AND ($5::text IS NULL OR mp.zaehlpunkt = $5)
+ 		GROUP BY m.id
+-		ORDER BY consumption_kwh DESC`
++		ORDER BY consumption_kwh DESC`, qf)
+ 
+ 	rows, err := r.db.Query(ctx, q, eegID, from, to, memberID, zaehlpunkt)
+ 	if err != nil {
+@@ -138,7 +142,7 @@ func (r *ReportRepository) RawMemberEnergy(ctx context.Context, eegID uuid.UUID,
+ // granularity must be one of: "day", "month", "year", "15min".
+ // Pass a non-nil memberID to restrict results to a single member.
+ // Pass a non-nil zaehlpunkt to restrict results to a single meter point.
+-func (r *ReportRepository) EnergySummary(ctx context.Context, eegID uuid.UUID, from, to time.Time, granularity string, memberID *uuid.UUID, zaehlpunkt *string) ([]domain.EnergySummaryRow, error) {
++func (r *ReportRepository) EnergySummary(ctx context.Context, eegID uuid.UUID, from, to time.Time, granularity string, memberID *uuid.UUID, zaehlpunkt *string, includeL3 bool) ([]domain.EnergySummaryRow, error) {
+ 	var periodExpr string
+ 	if granularity == "15min" {
+ 		periodExpr = `date_trunc('hour', er.ts AT TIME ZONE 'Europe/Vienna') + (FLOOR(EXTRACT(MINUTE FROM (er.ts AT TIME ZONE 'Europe/Vienna')) / 15) * INTERVAL '15 minutes')`
+@@ -147,6 +151,10 @@ func (r *ReportRepository) EnergySummary(ctx context.Context, eegID uuid.UUID, f
+ 		periodExpr = fmt.Sprintf("date_trunc('%s', er.ts AT TIME ZONE 'Europe/Vienna')", granularity)
+ 	}
+ 
++	qf := "AND er.quality <> 'L3'"
++	if includeL3 {
++		qf = ""
++	}
+ 	q := fmt.Sprintf(`
+ 		SELECT
+ 			%s AS period,
+@@ -160,11 +168,11 @@ func (r *ReportRepository) EnergySummary(ctx context.Context, eegID uuid.UUID, f
+ 		WHERE m.eeg_id = $1
+ 		  AND er.ts >= $2
+ 		  AND er.ts < $3
+-		  AND er.quality <> 'L3'
++		  %s
+ 		  AND ($4::uuid IS NULL OR m.id = $4)
+ 		  AND ($5::text IS NULL OR mp.zaehlpunkt = $5)
+ 		GROUP BY 1
+-		ORDER BY period ASC`, periodExpr)
++		ORDER BY period ASC`, periodExpr, qf)
+ 
+ 	rows, err := r.db.Query(ctx, q, eegID, from, to, memberID, zaehlpunkt)
+ 	if err != nil {
+diff --git a/web/app/eegs/[eegId]/reports/page.tsx b/web/app/eegs/[eegId]/reports/page.tsx
+index 5dc6a80..880f28b 100644
+--- a/web/app/eegs/[eegId]/reports/page.tsx
++++ b/web/app/eegs/[eegId]/reports/page.tsx
+@@ -159,6 +159,7 @@ export default function ReportsPage() {
+   // Member + meter point filter
+   const [selectedMemberId, setSelectedMemberId] = useState<string>("");
+   const [selectedZaehlpunkt, setSelectedZaehlpunkt] = useState<string>("");
++  const [includeL3, setIncludeL3] = useState(false);
+   const [members, setMembers] = useState<Member[]>([]);
+ 
+   // Data
+@@ -243,13 +244,14 @@ export default function ReportsPage() {
+       if (dataSource === "raw") {
+         const memberParam = selectedMemberId ? `&member_id=${selectedMemberId}` : "";
+         const zpParam = selectedZaehlpunkt ? `&zaehlpunkt=${encodeURIComponent(selectedZaehlpunkt)}` : "";
++        const l3Param = includeL3 ? "&include_l3=true" : "";
+         const [summaryRes, memberStatsRes] = await Promise.all([
+           fetch(
+-            `/api/eegs/${eegId}/energy/summary?from=${from}&to=${to}&granularity=${granularity}${memberParam}${zpParam}`,
++            `/api/eegs/${eegId}/energy/summary?from=${from}&to=${to}&granularity=${granularity}${memberParam}${zpParam}${l3Param}`,
+             { headers: authHeaders }
+           ),
+           // Raw mode: use actual readings per member (works for any date range incl. single day)
+-          fetch(`/api/eegs/${eegId}/energy/members?from=${from}&to=${to}${memberParam}${zpParam}`, {
++          fetch(`/api/eegs/${eegId}/energy/members?from=${from}&to=${to}${memberParam}${zpParam}${l3Param}`, {
+             headers: authHeaders,
+           }),
+         ]);
+@@ -274,7 +276,7 @@ export default function ReportsPage() {
+     } finally {
+       setLoading(false);
+     }
+-  }, [session, eegId, dataSource, getRange, periodMode, selectedYear, selectedMemberId, selectedZaehlpunkt]); // eslint-disable-line react-hooks/exhaustive-deps
++  }, [session, eegId, dataSource, getRange, periodMode, selectedYear, selectedMemberId, selectedZaehlpunkt, includeL3]); // eslint-disable-line react-hooks/exhaustive-deps
+ 
+   useEffect(() => {
+     load();
+@@ -629,10 +631,21 @@ export default function ReportsPage() {
+             <svg className="w-4 h-4 mt-0.5 shrink-0 text-amber-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+               <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
+             </svg>
+-            <span>
+-              <strong>L3-Messwerte im Zeitraum:</strong> Der Netzbetreiber hat fehlerhafte Messwerte (Qualitätskennzeichen L3) übermittelt — diese werden nicht abgerechnet.
+-              {" "}Betroffen: {names}.
+-            </span>
++            <div>
++              <p>
++                <strong>L3-Messwerte im Zeitraum:</strong> Der Netzbetreiber hat fehlerhafte Messwerte (Qualitätskennzeichen L3) übermittelt — diese werden nicht abgerechnet.
++                {" "}Betroffen: {names}.
++              </p>
++              <label className="mt-2 inline-flex items-center gap-2 cursor-pointer font-medium text-amber-900">
++                <input
++                  type="checkbox"
++                  checked={includeL3}
++                  onChange={(e) => setIncludeL3(e.target.checked)}
++                  className="h-4 w-4 rounded border-amber-400 text-amber-600 focus:ring-amber-500"
++                />
++                L3-Werte in dieser Auswertung anzeigen
++              </label>
++            </div>
+           </div>
+         );
+       })()}

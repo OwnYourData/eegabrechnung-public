@@ -1,0 +1,284 @@
+diff --git a/api/internal/billing/billing.go b/api/internal/billing/billing.go
+index 8e9169e..f0615a9 100644
+--- a/api/internal/billing/billing.go
++++ b/api/internal/billing/billing.go
+@@ -198,6 +198,10 @@ type RunOptions struct {
+ 	// Preview: if true, compute amounts and generate PDFs but do not persist
+ 	// any billing_run or invoice records — nothing is locked or committed.
+ 	Preview bool
++	// NoGenerationScaling: if true, skip the proportional scaling of generation
++	// (Einspeisung) credit. Each producer is credited its raw measured wh_community.
++	// Use when a faulty meter (measuring 0) would otherwise inflate other producers.
++	NoGenerationScaling bool
+ }
+ 
+ // OverlapError is returned when the requested period overlaps an existing billing run.
+@@ -290,10 +294,11 @@ func (s *Service) RunBilling(ctx context.Context, eegID uuid.UUID, opts RunOptio
+ 		"billing_type", opts.BillingType,
+ 		"member_filter_count", len(opts.MemberIDs),
+ 		"force", opts.Force,
++		"no_generation_scaling", opts.NoGenerationScaling,
+ 	)
+ 
+ 	// Get per-member energy sums split by direction (CONSUMPTION vs GENERATION)
+-	sums, err := s.readingRepo.SumByMemberAndPeriod(ctx, eegID, periodStart, periodEnd)
++	sums, err := s.readingRepo.SumByMemberAndPeriod(ctx, eegID, periodStart, periodEnd, !opts.NoGenerationScaling)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("sum by member: %w", err)
+ 	}
+@@ -381,7 +386,7 @@ func (s *Service) RunBilling(ctx context.Context, eegID uuid.UUID, opts RunOptio
+ 			}
+ 			// If the period was clamped, re-query energy sums for the effective window.
+ 			if effectiveStart != periodStart || effectiveEnd != periodEnd {
+-				if ms, err := s.readingRepo.SumForMember(ctx, eegID, sum.MemberID, effectiveStart, effectiveEnd); err == nil {
++				if ms, err := s.readingRepo.SumForMember(ctx, eegID, sum.MemberID, effectiveStart, effectiveEnd, !opts.NoGenerationScaling); err == nil {
+ 					consumptionKwh = ms.ConsumptionKwh
+ 					generationKwh = ms.GenerationKwh
+ 				}
+@@ -535,26 +540,26 @@ func (s *Service) RunBilling(ctx context.Context, eegID uuid.UUID, opts RunOptio
+ 		}
+ 
+ 		vatOpts := invoice.VATOptions{
+-			UseVat:               eeg.UseVat,
+-			VatPct:               eeg.VatPct,
+-			ConsumptionKwh:       consumptionKwh,
+-			GenerationKwh:        generationKwh,
+-			ConsumptionNet:       consumptionNet,
+-			GenerationNet:        generationCredit,
+-			EnergyPrice:          energyPriceCt,
+-			ProducerPrice:        producerPriceCt,
+-			ConsumptionVatPct:    consumptionVatPct,
+-			ConsumptionVatAmount: consumptionVatAmount,
+-			ConsumptionGross:     consumptionGross,
+-			GenerationVatPct:     generationVatPct,
+-			GenerationVatAmount:  generationVatAmount,
+-			GenerationGross:      generationGross,
+-			GenerationVatText:    generationVatText,
+-			ConsumptionReverseCharge:  consumptionReverseCharge,
+-			GenerationReverseCharge:   generationRC,
+-			ConsumptionMeterPointKwh:  consumptionMPs,
+-			GenerationMeterPointKwh:   generationMPs,
+-			MonthlyLineItems:          monthlyItems,
++			UseVat:                   eeg.UseVat,
++			VatPct:                   eeg.VatPct,
++			ConsumptionKwh:           consumptionKwh,
++			GenerationKwh:            generationKwh,
++			ConsumptionNet:           consumptionNet,
++			GenerationNet:            generationCredit,
++			EnergyPrice:              energyPriceCt,
++			ProducerPrice:            producerPriceCt,
++			ConsumptionVatPct:        consumptionVatPct,
++			ConsumptionVatAmount:     consumptionVatAmount,
++			ConsumptionGross:         consumptionGross,
++			GenerationVatPct:         generationVatPct,
++			GenerationVatAmount:      generationVatAmount,
++			GenerationGross:          generationGross,
++			GenerationVatText:        generationVatText,
++			ConsumptionReverseCharge: consumptionReverseCharge,
++			GenerationReverseCharge:  generationRC,
++			ConsumptionMeterPointKwh: consumptionMPs,
++			GenerationMeterPointKwh:  generationMPs,
++			MonthlyLineItems:         monthlyItems,
+ 			MeterFeeEur:              eeg.MeterFeeEur,
+ 			ParticipationFeeEur:      eeg.ParticipationFeeEur,
+ 		}
+@@ -709,7 +714,7 @@ func (s *Service) RegeneratePDF(ctx context.Context, invoiceID uuid.UUID) ([]byt
+ 	}
+ 
+ 	// Re-fetch energy sums for this member/period to recover per-direction data
+-	sums, err := s.readingRepo.SumByMemberAndPeriod(ctx, inv.EegID, inv.PeriodStart, inv.PeriodEnd)
++	sums, err := s.readingRepo.SumByMemberAndPeriod(ctx, inv.EegID, inv.PeriodStart, inv.PeriodEnd, true)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("sum readings: %w", err)
+ 	}
+@@ -802,10 +807,10 @@ func (s *Service) RegeneratePDF(ctx context.Context, invoiceID uuid.UUID) ([]byt
+ 		GenerationVatAmount:      generationVatAmount,
+ 		GenerationGross:          generationGross,
+ 		GenerationVatText:        generationVatText,
+-		ConsumptionReverseCharge:  consumptionReverseCharge,
+-		GenerationReverseCharge:   generationRC,
+-		ConsumptionMeterPointKwh:  consumptionMPs,
+-		GenerationMeterPointKwh:   generationMPs,
++		ConsumptionReverseCharge: consumptionReverseCharge,
++		GenerationReverseCharge:  generationRC,
++		ConsumptionMeterPointKwh: consumptionMPs,
++		GenerationMeterPointKwh:  generationMPs,
+ 	}
+ 
+ 	// Energy history for chart
+diff --git a/api/internal/handler/billing.go b/api/internal/handler/billing.go
+index 0cbdc90..5d77157 100644
+--- a/api/internal/handler/billing.go
++++ b/api/internal/handler/billing.go
+@@ -69,12 +69,13 @@ func (h *BillingHandler) RunBilling(w http.ResponseWriter, r *http.Request) {
+ 	var err error
+ 
+ 	var req struct {
+-		PeriodStart string   `json:"period_start"`
+-		PeriodEnd   string   `json:"period_end"`
+-		MemberIDs   []string `json:"member_ids"`
+-		BillingType string   `json:"billing_type"`
+-		Force       bool     `json:"force"`
+-		Preview     bool     `json:"preview"`
++		PeriodStart         string   `json:"period_start"`
++		PeriodEnd           string   `json:"period_end"`
++		MemberIDs           []string `json:"member_ids"`
++		BillingType         string   `json:"billing_type"`
++		Force               bool     `json:"force"`
++		Preview             bool     `json:"preview"`
++		NoGenerationScaling bool     `json:"no_generation_scaling"`
+ 	}
+ 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+ 		jsonError(w, "invalid request body", http.StatusBadRequest)
+@@ -106,12 +107,13 @@ func (h *BillingHandler) RunBilling(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	opts := billing.RunOptions{
+-		PeriodStart: start,
+-		PeriodEnd:   end,
+-		MemberIDs:   memberIDs,
+-		BillingType: req.BillingType,
+-		Force:       req.Force,
+-		Preview:     req.Preview,
++		PeriodStart:         start,
++		PeriodEnd:           end,
++		MemberIDs:           memberIDs,
++		BillingType:         req.BillingType,
++		Force:               req.Force,
++		Preview:             req.Preview,
++		NoGenerationScaling: req.NoGenerationScaling,
+ 	}
+ 
+ 	result, err := h.billingSvc.RunBilling(r.Context(), eeg.ID, opts)
+diff --git a/api/internal/repository/reading.go b/api/internal/repository/reading.go
+index a440b39..14d238a 100644
+--- a/api/internal/repository/reading.go
++++ b/api/internal/repository/reading.go
+@@ -218,7 +218,19 @@ func (r *ReadingRepository) SumByMeterPointForMember(ctx context.Context, member
+ // (total_consumer_wh_self / total_generator_wh_community) so that total credited
+ // generation equals total actual community consumption. Excess generation stays
+ // with the producers (they sell it themselves outside the EEG).
+-func (r *ReadingRepository) SumByMemberAndPeriod(ctx context.Context, eegID uuid.UUID, start, end time.Time) ([]MemberSum, error) {
++func (r *ReadingRepository) SumByMemberAndPeriod(ctx context.Context, eegID uuid.UUID, start, end time.Time, scaleGeneration bool) ([]MemberSum, error) {
++	generationExpr := `
++			CASE
++				WHEN (SELECT total_generator_community FROM totals) > 0
++				THEN COALESCE(SUM(CASE WHEN mp.energierichtung = 'GENERATION' THEN er.wh_community ELSE 0 END), 0)
++				     * (SELECT total_consumer_self FROM totals)
++				     / (SELECT total_generator_community FROM totals)
++				ELSE 0
++			END`
++	if !scaleGeneration {
++		generationExpr = `
++			COALESCE(SUM(CASE WHEN mp.energierichtung = 'GENERATION' THEN er.wh_community ELSE 0 END), 0)`
++	}
+ 	q := `
+ 		WITH totals AS (
+ 			SELECT
+@@ -235,13 +247,7 @@ func (r *ReadingRepository) SumByMemberAndPeriod(ctx context.Context, eegID uuid
+ 		SELECT
+ 			m.id AS member_id,
+ 			COALESCE(SUM(CASE WHEN mp.energierichtung = 'CONSUMPTION' THEN er.wh_self ELSE 0 END), 0) AS consumption_kwh,
+-			CASE
+-				WHEN (SELECT total_generator_community FROM totals) > 0
+-				THEN COALESCE(SUM(CASE WHEN mp.energierichtung = 'GENERATION' THEN er.wh_community ELSE 0 END), 0)
+-				     * (SELECT total_consumer_self FROM totals)
+-				     / (SELECT total_generator_community FROM totals)
+-				ELSE 0
+-			END AS generation_kwh
++` + generationExpr + ` AS generation_kwh
+ 		FROM members m
+ 		JOIN meter_points mp ON mp.member_id = m.id
+ 		JOIN energy_readings er ON er.meter_point_id = mp.id
+@@ -273,7 +279,19 @@ func (r *ReadingRepository) SumByMemberAndPeriod(ctx context.Context, eegID uuid
+ // (total_consumer_self / total_generator_community for the period), but scoped to one member.
+ // Used when a member's effective billing period differs from the billing run period due to
+ // beitritt_datum or austritt_datum falling within the period.
+-func (r *ReadingRepository) SumForMember(ctx context.Context, eegID, memberID uuid.UUID, start, end time.Time) (MemberSum, error) {
++func (r *ReadingRepository) SumForMember(ctx context.Context, eegID, memberID uuid.UUID, start, end time.Time, scaleGeneration bool) (MemberSum, error) {
++	generationExpr := `
++			CASE
++				WHEN (SELECT total_generator_community FROM totals) > 0
++				THEN COALESCE(SUM(CASE WHEN mp.energierichtung = 'GENERATION' THEN er.wh_community ELSE 0 END), 0)
++				     * (SELECT total_consumer_self FROM totals)
++				     / (SELECT total_generator_community FROM totals)
++				ELSE 0
++			END`
++	if !scaleGeneration {
++		generationExpr = `
++			COALESCE(SUM(CASE WHEN mp.energierichtung = 'GENERATION' THEN er.wh_community ELSE 0 END), 0)`
++	}
+ 	q := `
+ 		WITH totals AS (
+ 			SELECT
+@@ -290,13 +308,7 @@ func (r *ReadingRepository) SumForMember(ctx context.Context, eegID, memberID uu
+ 		SELECT
+ 			$4::uuid AS member_id,
+ 			COALESCE(SUM(CASE WHEN mp.energierichtung = 'CONSUMPTION' THEN er.wh_self ELSE 0 END), 0) AS consumption_kwh,
+-			CASE
+-				WHEN (SELECT total_generator_community FROM totals) > 0
+-				THEN COALESCE(SUM(CASE WHEN mp.energierichtung = 'GENERATION' THEN er.wh_community ELSE 0 END), 0)
+-				     * (SELECT total_consumer_self FROM totals)
+-				     / (SELECT total_generator_community FROM totals)
+-				ELSE 0
+-			END AS generation_kwh
++` + generationExpr + ` AS generation_kwh
+ 		FROM members m
+ 		JOIN meter_points mp ON mp.member_id = m.id
+ 		JOIN energy_readings er ON er.meter_point_id = mp.id
+diff --git a/web/components/billing-run-form.tsx b/web/components/billing-run-form.tsx
+index 334aded..075799f 100644
+--- a/web/components/billing-run-form.tsx
++++ b/web/components/billing-run-form.tsx
+@@ -89,6 +89,7 @@ export default function BillingRunForm({ eegId, members }: BillingRunFormProps)
+   const [selectedMemberIds, setSelectedMemberIds] = useState<string[]>([]);
+   const [billingType, setBillingType] = useState("all");
+   const [force, setForce] = useState(false);
++  const [noScaling, setNoScaling] = useState(false);
+   const [loading, setLoading] = useState(false);
+   const [success, setSuccess] = useState<BillingRun | null>(null);
+   const [error, setError] = useState<string | null>(null);
+@@ -122,6 +123,7 @@ export default function BillingRunForm({ eegId, members }: BillingRunFormProps)
+       };
+       if (selectedMemberIds.length > 0) body.member_ids = selectedMemberIds;
+       if (billingType !== "all") body.billing_type = billingType;
++      if (noScaling) body.no_generation_scaling = true;
+ 
+       const res = await fetch(`/api/eegs/${eegId}/billing/run`, {
+         method: "POST",
+@@ -401,7 +403,7 @@ export default function BillingRunForm({ eegId, members }: BillingRunFormProps)
+             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+           </svg>
+           Erweiterte Optionen
+-          {(selectedMemberIds.length > 0 || billingType !== "all") && (
++          {(selectedMemberIds.length > 0 || billingType !== "all" || noScaling) && (
+             <span className="ml-1 px-1.5 py-0.5 bg-amber-100 text-amber-700 rounded text-xs">aktiv</span>
+           )}
+         </button>
+@@ -432,6 +434,26 @@ export default function BillingRunForm({ eegId, members }: BillingRunFormProps)
+               </div>
+             </div>
+ 
++            {/* Einspeise-Skalierung */}
++            <div>
++              <label className="flex items-start gap-2 cursor-pointer">
++                <input
++                  type="checkbox"
++                  checked={noScaling}
++                  onChange={(e) => setNoScaling(e.target.checked)}
++                  className="w-4 h-4 mt-0.5 rounded border-slate-300 text-amber-600 focus:ring-amber-500"
++                />
++                <span className="text-sm text-slate-700">
++                  Einspeisung ohne Anpassungsfaktor abrechnen
++                  <span className="block text-xs text-slate-400 font-normal mt-0.5">
++                    Jeder Einspeiser wird mit seinen tatsächlich gemessenen kWh vergütet.
++                    Die fehlende Einspeisung eines defekten Zählers wird nicht auf die
++                    anderen Erzeuger umverteilt.
++                  </span>
++                </span>
++              </label>
++            </div>
++
+             {/* Member filter */}
+             {members.length > 0 && (
+               <div>

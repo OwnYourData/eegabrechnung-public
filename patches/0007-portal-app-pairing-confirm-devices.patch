@@ -1,0 +1,588 @@
+diff --git a/api/cmd/server/main.go b/api/cmd/server/main.go
+index 34c702c..7d503bd 100644
+--- a/api/cmd/server/main.go
++++ b/api/cmd/server/main.go
+@@ -205,6 +205,11 @@ func main() {
+ 	r.Get("/api/v1/public/portal/meter-points", portalHandler.GetMeterPoints)
+ 	r.Post("/api/v1/public/portal/change-factor", portalHandler.ChangeParticipationFactor)
+ 	r.Get("/api/v1/public/portal/app-token", portalHandler.GetAppToken)
++	r.Get("/api/v1/public/portal/app-pairings", portalHandler.GetAppPairings)
++	r.Post("/api/v1/public/portal/app-pairings/{pairingID}/confirm", portalHandler.ConfirmAppPairing)
++	r.Post("/api/v1/public/portal/app-pairings/{pairingID}/reject", portalHandler.RejectAppPairing)
++	r.Get("/api/v1/public/portal/app-sessions", portalHandler.GetAppSessions)
++	r.Delete("/api/v1/public/portal/app-sessions/{sessionID}", portalHandler.RevokeAppSession)
+ 	r.Post("/api/v1/public/portal/sepa-mandate", portalHandler.ChangeSepaMandate)
+ 	r.With(portalLimiter.Middleware).Post("/api/v1/public/portal/email-change", portalHandler.RequestEmailChange)
+ 	r.Post("/api/v1/public/portal/email-change/confirm/{token}", portalHandler.ConfirmEmailChange)
+diff --git a/api/internal/handler/portal_app_pairing.go b/api/internal/handler/portal_app_pairing.go
+new file mode 100644
+index 0000000..5d13462
+--- /dev/null
++++ b/api/internal/handler/portal_app_pairing.go
+@@ -0,0 +1,248 @@
++package handler
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/url"
++	"os"
++	"strings"
++	"time"
++
++	"github.com/go-chi/chi/v5"
++)
++
++// Cluster-internal GrünLicht app API. Both values come from the environment/secret —
++// never from code. (Constant-time comparison of the shared secret happens on the API
++// side, which verifies it; billing is only the client and merely sends the header.)
++const (
++	envGruenlichtAPIURL   = "GRUENLICHT_API_INTERNAL" // e.g. http://gruenlicht-api.eegabrechnung.svc.cluster.local
++	envInternalServiceTok = "INTERNAL_SERVICE_TOKEN"  // sent as X-Service-Token
++)
++
++var gruenlichtClient = &http.Client{Timeout: 10 * time.Second}
++
++// appPairing is one open pairing request as returned by the GrünLicht API.
++type appPairing struct {
++	ID          json.Number `json:"id"`
++	PairingCode string      `json:"pairingCode"`
++	DeviceLabel string      `json:"deviceLabel"`
++	RequestedAt string      `json:"requestedAt"`
++}
++
++// appSession is one active app session (a connected device).
++type appSession struct {
++	ID          json.Number `json:"id"`
++	DeviceLabel string      `json:"deviceLabel"`
++	CreatedAt   string      `json:"createdAt"`
++	LastUsedAt  string      `json:"lastUsedAt"`
++}
++
++// gruenlichtCall performs an authenticated request against the internal GrünLicht API.
++// out (optional) is decoded from the response body on 200.
++func gruenlichtCall(method, path string, out any) (int, error) {
++	base := strings.TrimRight(strings.TrimSpace(os.Getenv(envGruenlichtAPIURL)), "/")
++	tok := strings.TrimSpace(os.Getenv(envInternalServiceTok))
++	if base == "" || tok == "" {
++		return 0, fmt.Errorf("gruenlicht api not configured")
++	}
++	req, err := http.NewRequest(method, base+path, nil)
++	if err != nil {
++		return 0, err
++	}
++	req.Header.Set("X-Service-Token", tok)
++	req.Header.Set("Accept", "application/json")
++
++	resp, err := gruenlichtClient.Do(req)
++	if err != nil {
++		return 0, err
++	}
++	defer resp.Body.Close()
++
++	if out != nil && resp.StatusCode == http.StatusOK {
++		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
++			return resp.StatusCode, err
++		}
++		return resp.StatusCode, nil
++	}
++	_, _ = io.Copy(io.Discard, resp.Body)
++	return resp.StatusCode, nil
++}
++
++// listPairingsFor returns the OPEN pairing requests of exactly one member.
++func listPairingsFor(memberRef string) ([]appPairing, int, error) {
++	var items []appPairing
++	code, err := gruenlichtCall(http.MethodGet,
++		"/internal/pairings?member_ref="+url.QueryEscape(memberRef), &items)
++	return items, code, err
++}
++
++// listSessionsFor returns the ACTIVE app sessions of exactly one member.
++func listSessionsFor(memberRef string) ([]appSession, int, error) {
++	var items []appSession
++	code, err := gruenlichtCall(http.MethodGet,
++		"/internal/sessions?member_ref="+url.QueryEscape(memberRef), &items)
++	return items, code, err
++}
++
++// GetAppPairings returns the open pairing requests for the logged-in member.
++// Router: GET /api/v1/public/portal/app-pairings   (X-Portal-Session auth)
++func (h *MemberPortalHandler) GetAppPairings(w http.ResponseWriter, r *http.Request) {
++	memberID, _, ok := h.portalAuth(r)
++	if !ok {
++		jsonError(w, "unauthorized", http.StatusUnauthorized)
++		return
++	}
++	// SECURITY: member_ref ALWAYS comes from the session — never from the request.
++	items, code, err := listPairingsFor(memberID.String())
++	if err != nil {
++		jsonError(w, "pairing service unavailable", http.StatusServiceUnavailable)
++		return
++	}
++	if code != http.StatusOK {
++		jsonError(w, "pairing service error", http.StatusBadGateway)
++		return
++	}
++	if items == nil {
++		items = []appPairing{}
++	}
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(items)
++}
++
++// appPairingAction confirms or rejects a pairing request.
++//
++// SECURITY — this is the ENTIRE protection against a shoulder-surfed QR code:
++//   - reachable only from an authenticated portal session (portalAuth), and
++//   - the pairing MUST belong to the logged-in member. That is verified server-side by
++//     listing the member's OWN open pairings and requiring the id to be among them.
++//     member_ref comes from the session, NEVER from the request — so a caller cannot
++//     confirm a pairing that belongs to someone else.
++func (h *MemberPortalHandler) appPairingAction(w http.ResponseWriter, r *http.Request, action string) {
++	memberID, _, ok := h.portalAuth(r)
++	if !ok {
++		jsonError(w, "unauthorized", http.StatusUnauthorized)
++		return
++	}
++	id := strings.TrimSpace(chi.URLParam(r, "pairingID"))
++	if id == "" {
++		jsonError(w, "missing pairing id", http.StatusBadRequest)
++		return
++	}
++
++	items, code, err := listPairingsFor(memberID.String())
++	if err != nil || code != http.StatusOK {
++		jsonError(w, "pairing service unavailable", http.StatusServiceUnavailable)
++		return
++	}
++	owned := false
++	for _, it := range items {
++		if it.ID.String() == id {
++			owned = true
++			break
++		}
++	}
++	if !owned {
++		jsonError(w, "pairing does not belong to this member", http.StatusForbidden)
++		return
++	}
++
++	st, err := gruenlichtCall(http.MethodPost, "/internal/pairings/"+url.PathEscape(id)+"/"+action, nil)
++	if err != nil {
++		jsonError(w, "pairing service unavailable", http.StatusServiceUnavailable)
++		return
++	}
++	switch st {
++	case http.StatusNoContent:
++		w.WriteHeader(http.StatusNoContent)
++	case http.StatusNotFound:
++		jsonError(w, "pairing not found or no longer open", http.StatusNotFound)
++	case http.StatusGone:
++		jsonError(w, "pairing expired", http.StatusGone)
++	default:
++		jsonError(w, "pairing service error", http.StatusBadGateway)
++	}
++}
++
++// ConfirmAppPairing — POST /api/v1/public/portal/app-pairings/{pairingID}/confirm
++func (h *MemberPortalHandler) ConfirmAppPairing(w http.ResponseWriter, r *http.Request) {
++	h.appPairingAction(w, r, "confirm")
++}
++
++// RejectAppPairing — POST /api/v1/public/portal/app-pairings/{pairingID}/reject
++func (h *MemberPortalHandler) RejectAppPairing(w http.ResponseWriter, r *http.Request) {
++	h.appPairingAction(w, r, "reject")
++}
++
++// GetAppSessions lists the connected devices of the logged-in member.
++// Router: GET /api/v1/public/portal/app-sessions
++func (h *MemberPortalHandler) GetAppSessions(w http.ResponseWriter, r *http.Request) {
++	memberID, _, ok := h.portalAuth(r)
++	if !ok {
++		jsonError(w, "unauthorized", http.StatusUnauthorized)
++		return
++	}
++	items, code, err := listSessionsFor(memberID.String())
++	if err != nil {
++		jsonError(w, "session service unavailable", http.StatusServiceUnavailable)
++		return
++	}
++	if code != http.StatusOK {
++		jsonError(w, "session service error", http.StatusBadGateway)
++		return
++	}
++	if items == nil {
++		items = []appSession{}
++	}
++	w.Header().Set("Content-Type", "application/json")
++	_ = json.NewEncoder(w).Encode(items)
++}
++
++// RevokeAppSession revokes ("Zugriff entziehen") one connected device. Takes effect
++// immediately because the API keeps opaque, revocable sessions (no JWT).
++// SECURITY: same ownership rule — the session must belong to the logged-in member.
++// Router: DELETE /api/v1/public/portal/app-sessions/{sessionID}
++func (h *MemberPortalHandler) RevokeAppSession(w http.ResponseWriter, r *http.Request) {
++	memberID, _, ok := h.portalAuth(r)
++	if !ok {
++		jsonError(w, "unauthorized", http.StatusUnauthorized)
++		return
++	}
++	id := strings.TrimSpace(chi.URLParam(r, "sessionID"))
++	if id == "" {
++		jsonError(w, "missing session id", http.StatusBadRequest)
++		return
++	}
++
++	items, code, err := listSessionsFor(memberID.String())
++	if err != nil || code != http.StatusOK {
++		jsonError(w, "session service unavailable", http.StatusServiceUnavailable)
++		return
++	}
++	owned := false
++	for _, it := range items {
++		if it.ID.String() == id {
++			owned = true
++			break
++		}
++	}
++	if !owned {
++		jsonError(w, "session does not belong to this member", http.StatusForbidden)
++		return
++	}
++
++	st, err := gruenlichtCall(http.MethodDelete, "/internal/sessions/"+url.PathEscape(id), nil)
++	if err != nil {
++		jsonError(w, "session service unavailable", http.StatusServiceUnavailable)
++		return
++	}
++	switch st {
++	case http.StatusNoContent:
++		w.WriteHeader(http.StatusNoContent)
++	case http.StatusNotFound:
++		jsonError(w, "session not found", http.StatusNotFound)
++	default:
++		jsonError(w, "session service error", http.StatusBadGateway)
++	}
++}
+diff --git a/web/app/api/portal/app-pairings/[pairingId]/confirm/route.ts b/web/app/api/portal/app-pairings/[pairingId]/confirm/route.ts
+new file mode 100644
+index 0000000..5a20c16
+--- /dev/null
++++ b/web/app/api/portal/app-pairings/[pairingId]/confirm/route.ts
+@@ -0,0 +1,19 @@
++import { cookies } from "next/headers";
++const API = process.env.API_INTERNAL_URL || "http://localhost:8080";
++
++export async function POST(
++  _req: Request,
++  context: { params: Promise<{ pairingId: string }> }
++) {
++  const params = await context.params;
++  const cookieStore = await cookies();
++  const sessionToken = cookieStore.get("portal_session")?.value;
++  if (!sessionToken) return Response.json({ error: "Unauthorized" }, { status: 401 });
++
++  const res = await fetch(
++    `${API}/api/v1/public/portal/app-pairings/${params.pairingId}/confirm`,
++    { method: "POST", headers: { "X-Portal-Session": sessionToken } }
++  );
++  if (res.status === 204) return new Response(null, { status: 204 });
++  return Response.json({ error: "failed" }, { status: res.status });
++}
+diff --git a/web/app/api/portal/app-pairings/[pairingId]/reject/route.ts b/web/app/api/portal/app-pairings/[pairingId]/reject/route.ts
+new file mode 100644
+index 0000000..647c20e
+--- /dev/null
++++ b/web/app/api/portal/app-pairings/[pairingId]/reject/route.ts
+@@ -0,0 +1,19 @@
++import { cookies } from "next/headers";
++const API = process.env.API_INTERNAL_URL || "http://localhost:8080";
++
++export async function POST(
++  _req: Request,
++  context: { params: Promise<{ pairingId: string }> }
++) {
++  const params = await context.params;
++  const cookieStore = await cookies();
++  const sessionToken = cookieStore.get("portal_session")?.value;
++  if (!sessionToken) return Response.json({ error: "Unauthorized" }, { status: 401 });
++
++  const res = await fetch(
++    `${API}/api/v1/public/portal/app-pairings/${params.pairingId}/reject`,
++    { method: "POST", headers: { "X-Portal-Session": sessionToken } }
++  );
++  if (res.status === 204) return new Response(null, { status: 204 });
++  return Response.json({ error: "failed" }, { status: res.status });
++}
+diff --git a/web/app/api/portal/app-pairings/route.ts b/web/app/api/portal/app-pairings/route.ts
+new file mode 100644
+index 0000000..6823b6f
+--- /dev/null
++++ b/web/app/api/portal/app-pairings/route.ts
+@@ -0,0 +1,15 @@
++import { cookies } from "next/headers";
++const API = process.env.API_INTERNAL_URL || "http://localhost:8080";
++
++export async function GET() {
++  const cookieStore = await cookies();
++  const sessionToken = cookieStore.get("portal_session")?.value;
++  if (!sessionToken) return Response.json({ error: "Unauthorized" }, { status: 401 });
++
++  const res = await fetch(`${API}/api/v1/public/portal/app-pairings`, {
++    headers: { "X-Portal-Session": sessionToken },
++    cache: "no-store",
++  });
++  if (!res.ok) return Response.json({ error: "upstream error" }, { status: res.status });
++  return Response.json(await res.json(), { status: res.status });
++}
+diff --git a/web/app/api/portal/app-sessions/[sessionId]/route.ts b/web/app/api/portal/app-sessions/[sessionId]/route.ts
+new file mode 100644
+index 0000000..2ac2345
+--- /dev/null
++++ b/web/app/api/portal/app-sessions/[sessionId]/route.ts
+@@ -0,0 +1,19 @@
++import { cookies } from "next/headers";
++const API = process.env.API_INTERNAL_URL || "http://localhost:8080";
++
++export async function DELETE(
++  _req: Request,
++  context: { params: Promise<{ sessionId: string }> }
++) {
++  const params = await context.params;
++  const cookieStore = await cookies();
++  const sessionToken = cookieStore.get("portal_session")?.value;
++  if (!sessionToken) return Response.json({ error: "Unauthorized" }, { status: 401 });
++
++  const res = await fetch(`${API}/api/v1/public/portal/app-sessions/${params.sessionId}`, {
++    method: "DELETE",
++    headers: { "X-Portal-Session": sessionToken },
++  });
++  if (res.status === 204) return new Response(null, { status: 204 });
++  return Response.json({ error: "failed" }, { status: res.status });
++}
+diff --git a/web/app/api/portal/app-sessions/route.ts b/web/app/api/portal/app-sessions/route.ts
+new file mode 100644
+index 0000000..96e35a2
+--- /dev/null
++++ b/web/app/api/portal/app-sessions/route.ts
+@@ -0,0 +1,15 @@
++import { cookies } from "next/headers";
++const API = process.env.API_INTERNAL_URL || "http://localhost:8080";
++
++export async function GET() {
++  const cookieStore = await cookies();
++  const sessionToken = cookieStore.get("portal_session")?.value;
++  if (!sessionToken) return Response.json({ error: "Unauthorized" }, { status: 401 });
++
++  const res = await fetch(`${API}/api/v1/public/portal/app-sessions`, {
++    headers: { "X-Portal-Session": sessionToken },
++    cache: "no-store",
++  });
++  if (!res.ok) return Response.json({ error: "upstream error" }, { status: res.status });
++  return Response.json(await res.json(), { status: res.status });
++}
+diff --git a/web/app/portal/dashboard/PortalDashboardClient.tsx b/web/app/portal/dashboard/PortalDashboardClient.tsx
+index 40efb02..6b1983f 100644
+--- a/web/app/portal/dashboard/PortalDashboardClient.tsx
++++ b/web/app/portal/dashboard/PortalDashboardClient.tsx
+@@ -142,6 +142,108 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+     const id = setTimeout(() => setAppRemaining((sec) => Math.max(0, sec - 1)), 1000);
+     return () => clearTimeout(id);
+   }, [appQr, appRemaining]);
++
++  // ── App-Pairing (Bestätigung) + verbundene Geräte ────────────────────────────
++  const [pairing, setPairing] = useState<{ id: string; pairingCode: string; deviceLabel: string } | null>(null);
++  const [pairingBusy, setPairingBusy] = useState(false);
++  const [pairingMsg, setPairingMsg] = useState<string | null>(null);
++  const [devices, setDevices] = useState<
++    { id: string | number; deviceLabel: string; createdAt: string; lastUsedAt: string }[]
++  >([]);
++  const [devicesLoading, setDevicesLoading] = useState(false);
++
++  const fmtDT = (s: string) => {
++    const d = new Date(s);
++    return isNaN(d.getTime()) ? "–" : d.toLocaleString("de-AT", { dateStyle: "short", timeStyle: "short" });
++  };
++
++  const loadDevices = useCallback(() => {
++    setDevicesLoading(true);
++    fetch("/api/portal/app-sessions")
++      .then((r) => (r.ok ? r.json() : []))
++      .then((d) => setDevices(Array.isArray(d) ? d : []))
++      .catch(() => setDevices([]))
++      .finally(() => setDevicesLoading(false));
++  }, []);
++
++  useEffect(() => {
++    if (activeTab !== "app") return;
++    loadDevices();
++    // Sicherheitsnetz: hält die Liste auch ohne Reload aktuell.
++    const iv = setInterval(loadDevices, 10000);
++    return () => clearInterval(iv);
++  }, [activeTab, loadDevices]);
++
++  // Polling alle 2s — nur solange der QR gültig ist (die Pairing-Anfrage lebt ohnehin nur 2 Minuten).
++  const qrValid = appRemaining > 0;
++  useEffect(() => {
++    if (activeTab !== "app" || !qrValid) return;
++    let cancelled = false;
++    const tick = () => {
++      fetch("/api/portal/app-pairings")
++        .then((r) => (r.ok ? r.json() : []))
++        .then((list) => {
++          if (cancelled) return;
++          const p = Array.isArray(list) && list.length > 0 ? list[0] : null;
++          setPairing(
++            p
++              ? {
++                  id: String(p.id),
++                  pairingCode: String(p.pairingCode ?? ""),
++                  deviceLabel: String(p.deviceLabel ?? "Unbekanntes Gerät"),
++                }
++              : null
++          );
++        })
++        .catch(() => {});
++    };
++    tick();
++    const iv = setInterval(tick, 2000);
++    return () => {
++      cancelled = true;
++      clearInterval(iv);
++    };
++  }, [activeTab, qrValid]);
++
++  const respondPairing = useCallback(
++    (id: string, action: "confirm" | "reject") => {
++      setPairingBusy(true);
++      setPairingMsg(null);
++      fetch(`/api/portal/app-pairings/${id}/${action}`, { method: "POST" })
++        .then((r) => {
++          if (r.status === 204) {
++            setPairing(null);
++            setPairingMsg(
++              action === "confirm"
++                ? "Gerät erfolgreich verbunden."
++                : "Anfrage abgelehnt. Es wurde keine Verbindung hergestellt."
++            );
++            // Die GrünLicht-API legt die Session erst NACH dem Confirm an — deshalb
++            // kurz nachfassen, damit das neue Gerät ohne Reload sofort erscheint.
++            loadDevices();
++            setTimeout(loadDevices, 1000);
++            setTimeout(loadDevices, 3000);
++          } else if (r.status === 410) {
++            setPairing(null);
++            setPairingMsg("Die Anfrage ist abgelaufen. Bitte in der App erneut scannen.");
++          } else {
++            setPairingMsg("Die Anfrage konnte nicht verarbeitet werden.");
++          }
++        })
++        .catch(() => setPairingMsg("Verbindungsfehler."))
++        .finally(() => setPairingBusy(false));
++    },
++    [loadDevices]
++  );
++
++  const revokeDevice = useCallback(
++    (id: string) => {
++      fetch(`/api/portal/app-sessions/${id}`, { method: "DELETE" })
++        .then(() => loadDevices())
++        .catch(() => {});
++    },
++    [loadDevices]
++  );
+   const [currentIban, setCurrentIban] = useState(member.iban || "");
+   const [editingIban, setEditingIban] = useState(false);
+   const [newIban, setNewIban] = useState("");
+@@ -648,6 +750,47 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+                 Download bereitstehen.
+               </p>
+             </div>
++            {pairing && (
++              <div className="rounded-lg border-2 border-red-400 bg-red-50 p-4 space-y-3">
++                <p className="text-sm font-semibold text-red-900">
++                  Ein Gerät möchte sich mit deinem Konto verbinden.
++                </p>
++                <dl className="text-sm text-red-900 space-y-1">
++                  <div className="flex gap-2">
++                    <dt className="w-16 text-red-700">Gerät:</dt>
++                    <dd className="font-medium">{pairing.deviceLabel}</dd>
++                  </div>
++                  <div className="flex gap-2 items-center">
++                    <dt className="w-16 text-red-700">Code:</dt>
++                    <dd className="font-mono text-lg font-bold tracking-widest">{pairing.pairingCode}</dd>
++                  </div>
++                </dl>
++                <p className="text-xs text-red-800">
++                  Vergleiche den Code mit dem, der in deiner App angezeigt wird. Stimmt er{" "}
++                  <strong>nicht</strong> überein — oder hast du gerade gar nichts gescannt — dann bitte{" "}
++                  <strong>ablehnen</strong>.
++                </p>
++                <div className="flex gap-3">
++                  <button
++                    onClick={() => respondPairing(pairing.id, "confirm")}
++                    disabled={pairingBusy}
++                    className="px-4 py-2 text-sm font-medium rounded-lg bg-green-700 text-white hover:bg-green-800 disabled:opacity-60 transition-colors"
++                  >
++                    Bestätigen
++                  </button>
++                  <button
++                    onClick={() => respondPairing(pairing.id, "reject")}
++                    disabled={pairingBusy}
++                    className="px-4 py-2 text-sm font-medium rounded-lg bg-white border border-red-400 text-red-800 hover:bg-red-100 disabled:opacity-60 transition-colors"
++                  >
++                    Ablehnen
++                  </button>
++                </div>
++              </div>
++            )}
++            {pairingMsg && (
++              <p className="text-sm text-slate-700 bg-slate-100 rounded-lg px-4 py-2">{pairingMsg}</p>
++            )}
+             <div>
+               <h2 className="text-lg font-semibold text-slate-900">App verbinden</h2>
+               <p className="text-sm text-slate-600 mt-1">
+@@ -728,6 +871,39 @@ export default function PortalDashboardClient({ member, eeg, invoices, documents
+                 </p>
+               </div>
+             )}
++
++            <div className="border-t border-slate-200 pt-5">
++              <h3 className="text-base font-semibold text-slate-900 mb-1">Verbundene Geräte</h3>
++              <p className="text-xs text-slate-500 mb-3">
++                Geräte, die aktuell auf dein Konto zugreifen dürfen. „Zugriff entziehen“ wirkt sofort.
++              </p>
++              {devicesLoading && devices.length === 0 && (
++                <p className="text-sm text-slate-500">Wird geladen …</p>
++              )}
++              {!devicesLoading && devices.length === 0 && (
++                <p className="text-sm text-slate-500">Derzeit ist kein Gerät verbunden.</p>
++              )}
++              <ul className="divide-y divide-slate-200">
++                {devices.map((d) => (
++                  <li key={String(d.id)} className="py-3 flex items-center justify-between gap-3">
++                    <div className="min-w-0">
++                      <p className="text-sm font-medium text-slate-900 truncate">
++                        {d.deviceLabel || "Unbekanntes Gerät"}
++                      </p>
++                      <p className="text-xs text-slate-500">
++                        Verbunden seit {fmtDT(d.createdAt)} · zuletzt verwendet {fmtDT(d.lastUsedAt)}
++                      </p>
++                    </div>
++                    <button
++                      onClick={() => revokeDevice(String(d.id))}
++                      className="shrink-0 px-3 py-1.5 text-xs font-medium rounded-lg border border-red-300 text-red-700 hover:bg-red-50 transition-colors"
++                    >
++                      Zugriff entziehen
++                    </button>
++                  </li>
++                ))}
++              </ul>
++            </div>
+           </div>
+         )}
+ 
